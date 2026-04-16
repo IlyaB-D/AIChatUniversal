@@ -8,48 +8,94 @@ import {
   sendMessage,
 } from "@/lib/api";
 
+type ChatItem = {
+  id: number;
+  title: string;
+  model_slug?: string;
+};
+
+type MessageItem = {
+  id?: number;
+  role: string;
+  content: string;
+};
+
 export default function Chat() {
-  const [chats, setChats] = useState<any[]>([]);
-  const [messages, setMessages] = useState<any[]>([]);
+  const [chats, setChats] = useState<ChatItem[]>([]);
+  const [messages, setMessages] = useState<MessageItem[]>([]);
   const [chatId, setChatId] = useState<number | null>(null);
   const [message, setMessage] = useState("");
 
   useEffect(() => {
-    getChats().then(setChats);
+    const loadChats = async () => {
+      try {
+        const items = await getChats();
+        setChats(Array.isArray(items) ? items : []);
+      } catch (error) {
+        console.error("Ошибка загрузки чатов:", error);
+      }
+    };
+
+    loadChats();
   }, []);
 
   const handleCreateChat = async () => {
-    const chat = await createChat();
-    setChats(prev => [chat, ...prev]);
+    try {
+      const chat = await createChat({
+        title: "Новый чат",
+        model_slug: "gpt-4.1",
+        system_prompt: "",
+      });
+
+      setChats((prev) => [chat, ...prev]);
+      setChatId(chat.id);
+      setMessages([]);
+    } catch (error) {
+      console.error("Ошибка создания чата:", error);
+    }
   };
 
   const handleLoadChat = async (id: number) => {
-    setChatId(id);
-    const history = await getHistory(id);
-    setMessages(history);
+    try {
+      setChatId(id);
+      const history = await getHistory(id);
+      setMessages(Array.isArray(history) ? history : []);
+    } catch (error) {
+      console.error("Ошибка загрузки истории:", error);
+    }
   };
 
   const handleSend = async () => {
-    if (!chatId || !message) return;
+    if (!chatId || !message.trim()) {
+      return;
+    }
 
-    const res = await sendMessage(chatId, message);
+    try {
+      const userText = message.trim();
 
-    setMessages(prev => [
-      ...prev,
-      res.user_message,
-      res.assistant_message,
-    ]);
+      const response = await sendMessage({
+        chat_id: chatId,
+        message: userText,
+      });
 
-    setMessage("");
+      setMessages((prev) => [
+        ...prev,
+        { role: "user", content: userText },
+        response,
+      ]);
+
+      setMessage("");
+    } catch (error) {
+      console.error("Ошибка отправки сообщения:", error);
+    }
   };
 
   return (
     <div style={{ display: "flex", height: "100vh" }}>
-      {/* Sidebar */}
       <div style={{ width: 300, borderRight: "1px solid #ccc", padding: 10 }}>
         <button onClick={handleCreateChat}>+ Новый чат</button>
 
-        {chats.map(chat => (
+        {chats.map((chat) => (
           <div
             key={chat.id}
             onClick={() => handleLoadChat(chat.id)}
@@ -60,11 +106,10 @@ export default function Chat() {
         ))}
       </div>
 
-      {/* Chat */}
       <div style={{ flex: 1, padding: 10 }}>
         <div style={{ height: "80%", overflow: "auto" }}>
           {messages.map((m, i) => (
-            <div key={i}>
+            <div key={m.id ?? i}>
               <b>{m.role}:</b> {m.content}
             </div>
           ))}
@@ -73,7 +118,7 @@ export default function Chat() {
         <div style={{ marginTop: 10 }}>
           <input
             value={message}
-            onChange={e => setMessage(e.target.value)}
+            onChange={(e) => setMessage(e.target.value)}
             style={{ width: "80%" }}
           />
           <button onClick={handleSend}>Отправить</button>
