@@ -1,7 +1,7 @@
 "use client";
 
 import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
-import { api } from "@/lib/api";
+import { api, initAuthToken, setAuthToken } from "@/lib/api";
 
 type ChatItem = {
   id: number;
@@ -136,6 +136,11 @@ export default function Chat() {
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
+  const selectedChat = useMemo(
+    () => chats.find((chat) => chat.id === selectedChatId) || null,
+    [chats, selectedChatId]
+  );
+
   function resetChatState() {
     setChats([]);
     setSelectedChatId(null);
@@ -155,10 +160,7 @@ export default function Chat() {
   }
 
   async function initializeAuth() {
-    const token =
-      typeof window !== "undefined"
-        ? localStorage.getItem("access_token")
-        : null;
+    const token = initAuthToken();
 
     if (!token) {
       setIsAuthenticated(false);
@@ -173,7 +175,7 @@ export default function Chat() {
       setIsAuthenticated(true);
     } catch (err) {
       console.error("Ошибка проверки токена:", err);
-      localStorage.removeItem("access_token");
+      setAuthToken(null);
       setAuthUser(null);
       setIsAuthenticated(false);
     } finally {
@@ -203,7 +205,7 @@ export default function Chat() {
         password,
       });
 
-      localStorage.setItem("access_token", response.data.access_token);
+      setAuthToken(response.data.access_token);
       setAuthUser(response.data.user);
       setIsAuthenticated(true);
       setAuthPassword("");
@@ -231,7 +233,7 @@ export default function Chat() {
   }
 
   async function handleLogout() {
-    localStorage.removeItem("access_token");
+    setAuthToken(null);
     setIsAuthenticated(false);
     setAuthUser(null);
     setAuthEmail("");
@@ -274,21 +276,24 @@ export default function Chat() {
   async function loadChats() {
     try {
       setLoadingChats(true);
-      setErrorText(null);
 
       const response = await api.get("/chats");
       const items = response.data?.items ?? response.data ?? [];
-      const normalizedChats = Array.isArray(items) ? items : [];
-      setChats(normalizedChats);
+      const normalized = Array.isArray(items) ? items : [];
 
-      if (!selectedChatId && normalizedChats.length > 0) {
-        await loadChatHistory(normalizedChats[0].id);
+      setChats(normalized);
+
+      if (normalized.length > 0 && selectedChatId == null) {
+        setSelectedChatId(normalized[0].id);
       }
     } catch (err: any) {
       console.error("Ошибка загрузки чатов:", err);
 
       if (err?.response?.status === 401) {
-        await handleLogout();
+        setAuthToken(null);
+        setIsAuthenticated(false);
+        setAuthUser(null);
+        resetChatState();
         return;
       }
 
@@ -298,18 +303,32 @@ export default function Chat() {
     }
   }
 
+  async function loadMessages(chatId: number) {
+    try {
+      setLoadingMessages(true);
+
+      const response = await api.get(`/history/${chatId}`);
+      const items = response.data?.items ?? response.data ?? [];
+      const normalized = Array.isArray(items) ? items : [];
+
+      setMessages(normalized);
+    } catch (err) {
+      console.error("Ошибка загрузки сообщений:", err);
+      setErrorText("Не удалось загрузить историю чата.");
+    } finally {
+      setLoadingMessages(false);
+    }
+  }
+
   async function loadAttachments(chatId: number) {
     try {
       setLoadingAttachments(true);
 
       const response = await api.get(`/attachments/chat/${chatId}`);
-      const items =
-        response.data?.items ??
-        response.data?.attachments ??
-        response.data ??
-        [];
+      const items = response.data?.items ?? response.data ?? [];
+      const normalized = Array.isArray(items) ? items : [];
 
-      setAttachments(Array.isArray(items) ? items : []);
+      setAttachments(normalized);
     } catch (err) {
       console.error("Ошибка загрузки вложений:", err);
       setAttachments([]);
@@ -318,60 +337,23 @@ export default function Chat() {
     }
   }
 
-  async function loadChatHistory(chatId: number) {
-    try {
-      setLoadingMessages(true);
-      setErrorText(null);
-      setWarningText(null);
-
-      const response = await api.get(`/history/${chatId}`);
-      const items =
-        response.data?.items ??
-        response.data?.messages ??
-        response.data ??
-        [];
-
-      const normalizedMessages: MessageItem[] = (Array.isArray(items) ? items : []).map(
-        (msg: MessageItem) => ({
-          ...msg,
-          image_url: normalizeImageUrl(msg.image_url),
-        })
-      );
-
-      setMessages(normalizedMessages);
-      setSelectedChatId(chatId);
-      setSelectedFiles([]);
-      setMessage("");
-      setViewMode("chat");
-
-      if (fileInputRef.current) {
-        fileInputRef.current.value = "";
-      }
-
-      await loadAttachments(chatId);
-    } catch (err) {
-      console.error("Ошибка загрузки истории:", err);
-      setErrorText("Не удалось загрузить историю чата.");
-    } finally {
-      setLoadingMessages(false);
-    }
-  }
-
   async function handleCreateChat() {
     try {
       setCreatingChat(true);
       setErrorText(null);
-      setWarningText(null);
 
-      const response = await api.post("/chat/create", {
+      const response = await api.post("/chats", {
         title: "Новый чат",
         model_slug: selectedDefaultModelSlug,
+        system_prompt: "",
       });
 
-      const newChat: ChatItem = response.data;
+      const createdChat = response.data as ChatItem;
 
       await loadChats();
-      await loadChatHistory(newChat.id);
+      setSelectedChatId(createdChat.id);
+      await loadMessages(createdChat.id);
+      await loadAttachments(createdChat.id);
     } catch (err) {
       console.error("Ошибка создания чата:", err);
       setErrorText("Не удалось создать новый чат.");
@@ -380,65 +362,128 @@ export default function Chat() {
     }
   }
 
-  async function handleRenameChat(chatId: number, currentTitle: string) {
-    const raw = window.prompt("Введите новое название чата", currentTitle);
-    if (raw === null) return;
+  async function handleSelectChat(chatId: number) {
+    setSelectedChatId(chatId);
+    await Promise.all([loadMessages(chatId), loadAttachments(chatId)]);
+  }
 
-    const nextTitle = raw.trim();
-    if (!nextTitle) {
-      setErrorText("Название чата не может быть пустым.");
+  async function handleSendMessage() {
+    if (!selectedChatId || !message.trim()) {
       return;
     }
 
     try {
+      setSending(true);
       setErrorText(null);
 
-      await api.patch(`/chats/${chatId}`, {
-        title: nextTitle,
+      await api.post("/chat", {
+        chat_id: selectedChatId,
+        message: message.trim(),
+        model_slug: selectedChat?.model_slug || selectedDefaultModelSlug,
       });
 
-      setChats((prev) =>
-        prev.map((chat) =>
-          chat.id === chatId ? { ...chat, title: nextTitle } : chat
-        )
-      );
+      setMessage("");
+      await loadMessages(selectedChatId);
+      await loadChats();
     } catch (err) {
-      console.error("Ошибка переименования чата:", err);
-      setErrorText("Не удалось переименовать чат.");
+      console.error("Ошибка отправки сообщения:", err);
+      setErrorText("Не удалось отправить сообщение.");
+    } finally {
+      setSending(false);
+    }
+  }
+
+  async function handleGenerateImage() {
+    if (!selectedChatId || !imagePrompt.trim()) {
+      return;
+    }
+
+    try {
+      setGeneratingImage(true);
+      setErrorText(null);
+
+      await api.post(
+        `/images/generate?prompt=${encodeURIComponent(
+          imagePrompt.trim()
+        )}&chat_id=${selectedChatId}`
+      );
+
+      setImagePrompt("");
+      await loadMessages(selectedChatId);
+    } catch (err) {
+      console.error("Ошибка генерации изображения:", err);
+      setErrorText("Не удалось сгенерировать изображение.");
+    } finally {
+      setGeneratingImage(false);
+    }
+  }
+
+  async function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(event.target.files || []);
+    setSelectedFiles(files);
+  }
+
+  async function handleUploadFiles() {
+    if (!selectedChatId || selectedFiles.length === 0) {
+      return;
+    }
+
+    try {
+      setUploadingFiles(true);
+      setErrorText(null);
+
+      for (const file of selectedFiles) {
+        const formData = new FormData();
+        formData.append("chat_id", String(selectedChatId));
+        formData.append("file", file);
+
+        await api.post("/attachments/upload", formData, {
+          headers: {
+            "Content-Type": "multipart/form-data",
+          },
+        });
+      }
+
+      setSelectedFiles([]);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+
+      await loadAttachments(selectedChatId);
+    } catch (err: any) {
+      console.error("Ошибка загрузки файлов:", err);
+
+      const backendMessage =
+        err?.response?.data?.detail ||
+        err?.response?.data?.message ||
+        "Не удалось загрузить файл.";
+
+      setErrorText(String(backendMessage));
+    } finally {
+      setUploadingFiles(false);
     }
   }
 
   async function handleDeleteChat(chatId: number) {
-    const targetChat = chats.find((chat) => chat.id === chatId);
-    const confirmed = window.confirm(
-      `Удалить чат "${targetChat?.title || `#${chatId}`}"? Это действие нельзя отменить.`
-    );
-
-    if (!confirmed) return;
-
     try {
       setDeletingChatId(chatId);
       setErrorText(null);
 
       await api.delete(`/chats/${chatId}`);
 
-      const isCurrentChat = selectedChatId === chatId;
+      const nextChats = chats.filter((chat) => chat.id !== chatId);
+      setChats(nextChats);
 
-      if (isCurrentChat) {
-        setSelectedChatId(null);
+      if (selectedChatId === chatId) {
+        const nextSelected = nextChats[0]?.id ?? null;
+        setSelectedChatId(nextSelected);
         setMessages([]);
         setAttachments([]);
-        setSelectedFiles([]);
-        setMessage("");
-        setWarningText(null);
-        setViewMode("chat");
 
-        if (fileInputRef.current) {
-          fileInputRef.current.value = "";
+        if (nextSelected) {
+          await Promise.all([loadMessages(nextSelected), loadAttachments(nextSelected)]);
         }
       }
-
-      await loadChats();
     } catch (err) {
       console.error("Ошибка удаления чата:", err);
       setErrorText("Не удалось удалить чат.");
@@ -450,22 +495,8 @@ export default function Chat() {
   async function handleDeleteAttachment(attachmentId: number) {
     if (!selectedChatId) return;
 
-    const targetAttachment = attachments.find((item) => item.id === attachmentId);
-    const fileName =
-      targetAttachment?.original_name ||
-      targetAttachment?.file_name ||
-      `Файл #${attachmentId}`;
-
-    const confirmed = window.confirm(
-      `Удалить файл "${fileName}" из этого чата?`
-    );
-
-    if (!confirmed) return;
-
     try {
       setDeletingAttachmentId(attachmentId);
-      setErrorText(null);
-
       await api.delete(`/attachments/${attachmentId}`);
       await loadAttachments(selectedChatId);
     } catch (err) {
@@ -476,40 +507,16 @@ export default function Chat() {
     }
   }
 
-  async function handleChangeChatModel(nextModelSlug: string) {
-    if (!selectedChatId) return;
-    if (!nextModelSlug.trim()) return;
-
-    const currentChat = chats.find((chat) => chat.id === selectedChatId);
-    if (currentChat?.model_slug === nextModelSlug) return;
-
-    const chatHasImages = attachments.some((attachment) =>
-      (attachment.mime_type || "").startsWith("image/")
-    );
-
+  async function handleChangeChatModel(chatId: number, nextModelSlug: string) {
     try {
       setUpdatingModel(true);
       setErrorText(null);
 
-      await api.patch(`/chats/${selectedChatId}`, {
+      await api.patch(`/chats/${chatId}`, {
         model_slug: nextModelSlug,
       });
 
-      setChats((prev) =>
-        prev.map((chat) =>
-          chat.id === selectedChatId
-            ? { ...chat, model_slug: nextModelSlug }
-            : chat
-        )
-      );
-
-      if (chatHasImages && !isVisionModel(nextModelSlug)) {
-        setWarningText(
-          `В этом чате уже есть изображения. Модель ${nextModelSlug} может не поддерживать их анализ. Файлы останутся в чате, но для image/vision-запросов лучше использовать gpt-4.1.`
-        );
-      } else {
-        setWarningText(null);
-      }
+      await loadChats();
     } catch (err) {
       console.error("Ошибка смены модели:", err);
       setErrorText("Не удалось изменить модель чата.");
@@ -518,257 +525,17 @@ export default function Chat() {
     }
   }
 
-  function handleFilesChange(event: ChangeEvent<HTMLInputElement>) {
-    const files = Array.from(event.target.files || []);
-    setSelectedFiles(files);
-  }
-
-  function removeSelectedFile(indexToRemove: number) {
-    setSelectedFiles((prev) => prev.filter((_, index) => index !== indexToRemove));
-
-    if (fileInputRef.current && selectedFiles.length <= 1) {
-      fileInputRef.current.value = "";
-    }
-  }
-
-  async function uploadSelectedFiles(chatId: number) {
-    if (!selectedFiles.length) return;
-
-    setUploadingFiles(true);
-
-    try {
-      for (const file of selectedFiles) {
-        const formData = new FormData();
-        formData.append("chat_id", String(chatId));
-        formData.append("file", file);
-
-        await api.post("/attachments/upload", formData, {
-          headers: {
-            "Content-Type": "multipart/form-data",
-          },
-        });
-      }
-
-      await loadAttachments(chatId);
-    } finally {
-      setUploadingFiles(false);
-    }
-  }
-
-  async function handleSendMessage() {
-    if (!selectedChatId || sending) return;
-
-    const trimmedMessage = message.trim();
-    if (!trimmedMessage && selectedFiles.length === 0) return;
-
-    const selectedChat =
-      chats.find((chat) => chat.id === selectedChatId) || null;
-
-    const hasImages = selectedFiles.some(isImageFile);
-    const canUseVision = isVisionModel(selectedChat?.model_slug);
-
-    if (hasImages && !canUseVision) {
-      setWarningText(
-        `В этом чате выбрана модель ${selectedChat?.model_slug}. Сейчас изображения корректно анализируются через vision-модель gpt-4.1. Для описания PNG/JPG открой чат на gpt-4.1.`
-      );
-    } else {
-      setWarningText(null);
-    }
-
-    const optimisticUserMessage: MessageItem | null = trimmedMessage
-      ? {
-          id: Date.now(),
-          chat_id: selectedChatId,
-          role: "user",
-          content: trimmedMessage,
-          created_at: new Date().toISOString(),
-          model_slug: selectedChat?.model_slug || null,
-        }
-      : null;
-
-    try {
-      setSending(true);
-      setErrorText(null);
-
-      if (optimisticUserMessage) {
-        setMessages((prev) => [...prev, optimisticUserMessage]);
-      }
-
-      setMessage("");
-
-      if (selectedFiles.length > 0) {
-        await uploadSelectedFiles(selectedChatId);
-      }
-
-      if (!trimmedMessage) {
-        setSelectedFiles([]);
-        if (fileInputRef.current) {
-          fileInputRef.current.value = "";
-        }
-        return;
-      }
-
-      const response = await api.post("/chat/send", {
-        chat_id: selectedChatId,
-        message: trimmedMessage,
-      });
-
-      const data = response.data;
-
-      setMessages((prev) => {
-        const withoutOptimistic = optimisticUserMessage
-          ? prev.filter((msg) => msg.id !== optimisticUserMessage.id)
-          : prev;
-
-        return [
-          ...withoutOptimistic,
-          {
-            ...data.user_message,
-            image_url: normalizeImageUrl(data.user_message?.image_url),
-          },
-          {
-            ...data.assistant_message,
-            image_url: normalizeImageUrl(data.assistant_message?.image_url),
-          },
-        ];
-      });
-
-      setSelectedFiles([]);
-      if (fileInputRef.current) {
-        fileInputRef.current.value = "";
-      }
-
-      await Promise.all([loadChats(), loadAttachments(selectedChatId)]);
-    } catch (err) {
-      console.error("Ошибка отправки сообщения:", err);
-
-      if (optimisticUserMessage) {
-        setMessages((prev) =>
-          prev.filter((msg) => msg.id !== optimisticUserMessage.id)
-        );
-      }
-
-      setMessage(trimmedMessage);
-      setErrorText("Не удалось отправить сообщение или загрузить файлы.");
-    } finally {
-      setSending(false);
-    }
-  }
-
-  async function handleGenerateImage() {
-    if (!selectedChatId) {
-      setErrorText("Сначала выберите чат для сохранения изображения.");
-      return;
-    }
-
-    if (!imagePrompt.trim()) return;
-
-    try {
-      setGeneratingImage(true);
-      setErrorText(null);
-
-      await api.post("/images/generate", null, {
-        params: {
-          prompt: imagePrompt.trim(),
-          chat_id: selectedChatId,
-        },
-      });
-
-      setImagePrompt("");
-      await loadChatHistory(selectedChatId);
-      setViewMode("chat");
-    } catch (err) {
-      console.error("Ошибка генерации изображения:", err);
-      setErrorText("Не удалось сгенерировать изображение.");
-    } finally {
-      setGeneratingImage(false);
-    }
-  }
-
-  async function copyToClipboard(text: string, successLabel: string) {
+  async function copyText(text: string) {
     try {
       await navigator.clipboard.writeText(text);
-      setCopiedText(successLabel);
-      setTimeout(() => setCopiedText(null), 2000);
+      setCopiedText("Текст скопирован");
+      setTimeout(() => setCopiedText(null), 1500);
     } catch (err) {
       console.error("Ошибка копирования:", err);
-      setErrorText("Не удалось скопировать текст.");
+      setWarningText("Не удалось скопировать текст.");
+      setTimeout(() => setWarningText(null), 1500);
     }
   }
-
-  function buildChatTranscript(): string {
-    if (!selectedChat) return "";
-
-    const lines: string[] = [];
-    lines.push(`# ${selectedChat.title}`);
-    lines.push(`Модель: ${selectedChat.model_slug}`);
-    lines.push("");
-
-    for (const msg of messages) {
-      lines.push(`## ${msg.role}`);
-
-      if (msg.content) {
-        lines.push(msg.content);
-      }
-
-      if (msg.image_url) {
-        lines.push(`[image] ${msg.image_url}`);
-      }
-
-      lines.push("");
-    }
-
-    return lines.join("\n");
-  }
-
-  async function handleCopyChat() {
-    const transcript = buildChatTranscript();
-    if (!transcript) return;
-
-    await copyToClipboard(transcript, "Чат скопирован");
-  }
-
-  function handleDownloadChat() {
-    const transcript = buildChatTranscript();
-    if (!transcript) return;
-
-    const safeTitle = (selectedChat?.title || "chat")
-      .replace(/[\\/:*?"<>|]/g, "_")
-      .trim();
-
-    const blob = new Blob([transcript], { type: "text/markdown;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `${safeTitle || "chat"}.md`;
-    link.click();
-
-    URL.revokeObjectURL(url);
-  }
-
-  function formatTime(value?: string | null) {
-    if (!value) return "";
-
-    const date = new Date(value);
-    if (Number.isNaN(date.getTime())) return "";
-
-    return date.toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-  }
-
-  const selectedChat =
-    chats.find((chat) => chat.id === selectedChatId) || null;
-
-  const selectedFilesInfo = useMemo(() => {
-    return {
-      total: selectedFiles.length,
-      images: selectedFiles.filter(isImageFile).length,
-      nonImages: selectedFiles.filter((file) => !isImageFile(file)).length,
-    };
-  }, [selectedFiles]);
 
   useEffect(() => {
     void initializeAuth();
@@ -776,232 +543,101 @@ export default function Chat() {
 
   useEffect(() => {
     if (!isAuthenticated) return;
-    void Promise.all([loadModels(), loadChats()]);
+    void loadModels();
+    void loadChats();
   }, [isAuthenticated]);
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({
-      behavior: "smooth",
-      block: "end",
-    });
-  }, [messages, sending, loadingMessages]);
+    if (!isAuthenticated || !selectedChatId) return;
+    void loadMessages(selectedChatId);
+    void loadAttachments(selectedChatId);
+  }, [isAuthenticated, selectedChatId]);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  const currentChat = useMemo(
+    () => chats.find((chat) => chat.id === selectedChatId) ?? null,
+    [chats, selectedChatId]
+  );
 
   if (authChecking) {
     return (
-      <div
-        style={{
-          minHeight: "100vh",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          background: "#f5f7fb",
-          fontFamily: "Inter, Arial, Helvetica, sans-serif",
-        }}
-      >
-        <div
-          style={{
-            width: 420,
-            padding: 28,
-            background: "#ffffff",
-            borderRadius: 20,
-            border: "1px solid #e5e7eb",
-            boxShadow: "0 12px 30px rgba(15,23,42,0.08)",
-            textAlign: "center",
-            color: "#374151",
-          }}
-        >
-          Проверка авторизации...
-        </div>
+      <div className="flex min-h-screen items-center justify-center bg-slate-950 text-white">
+        Проверка авторизации...
       </div>
     );
   }
 
   if (!isAuthenticated) {
     return (
-      <div
-        style={{
-          minHeight: "100vh",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          background: "linear-gradient(180deg, #f8fbff 0%, #f5f7fb 100%)",
-          fontFamily: "Inter, Arial, Helvetica, sans-serif",
-          padding: 24,
-        }}
-      >
-        <div
-          style={{
-            width: "100%",
-            maxWidth: 440,
-            background: "#ffffff",
-            border: "1px solid #e5e7eb",
-            borderRadius: 24,
-            boxShadow: "0 16px 40px rgba(15,23,42,0.08)",
-            padding: 28,
-          }}
-        >
-          <div
-            style={{
-              fontSize: 28,
-              fontWeight: 800,
-              color: "#111827",
-              marginBottom: 10,
-              textAlign: "center",
-            }}
-          >
-            AIChatUniversal
-          </div>
+      <div className="flex min-h-screen items-center justify-center bg-slate-950 px-4 text-white">
+        <div className="w-full max-w-md rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-2xl">
+          <h1 className="mb-2 text-2xl font-bold">AIChatUniversal</h1>
+          <p className="mb-6 text-sm text-slate-400">
+            Войдите или зарегистрируйтесь, чтобы продолжить.
+          </p>
 
-          <div
-            style={{
-              textAlign: "center",
-              color: "#6b7280",
-              fontSize: 14,
-              lineHeight: 1.6,
-              marginBottom: 20,
-            }}
-          >
-            {authMode === "login"
-              ? "Войдите, чтобы открыть свои чаты и продолжить работу."
-              : "Создайте аккаунт, чтобы начать работу с чатами и генерацией изображений."}
-          </div>
-
-          <div
-            style={{
-              display: "flex",
-              background: "#f3f4f6",
-              borderRadius: 14,
-              padding: 4,
-              gap: 4,
-              marginBottom: 18,
-            }}
-          >
+          <div className="mb-6 flex rounded-xl bg-slate-800 p-1">
             <button
               type="button"
-              onClick={() => {
-                setAuthMode("login");
-                setAuthError(null);
-              }}
-              style={{
-                flex: 1,
-                height: 42,
-                border: "none",
-                borderRadius: 10,
-                background: authMode === "login" ? "#111827" : "transparent",
-                color: authMode === "login" ? "#ffffff" : "#374151",
-                fontSize: 14,
-                fontWeight: 700,
-                cursor: "pointer",
-              }}
+              className={`flex-1 rounded-lg px-4 py-2 text-sm font-medium ${
+                authMode === "login"
+                  ? "bg-white text-slate-900"
+                  : "text-slate-300"
+              }`}
+              onClick={() => setAuthMode("login")}
             >
               Вход
             </button>
-
             <button
               type="button"
-              onClick={() => {
-                setAuthMode("register");
-                setAuthError(null);
-              }}
-              style={{
-                flex: 1,
-                height: 42,
-                border: "none",
-                borderRadius: 10,
-                background: authMode === "register" ? "#111827" : "transparent",
-                color: authMode === "register" ? "#ffffff" : "#374151",
-                fontSize: 14,
-                fontWeight: 700,
-                cursor: "pointer",
-              }}
+              className={`flex-1 rounded-lg px-4 py-2 text-sm font-medium ${
+                authMode === "register"
+                  ? "bg-white text-slate-900"
+                  : "text-slate-300"
+                }`}
+              onClick={() => setAuthMode("register")}
             >
               Регистрация
             </button>
           </div>
 
-          {authError && (
-            <div
-              style={{
-                marginBottom: 16,
-                padding: "12px 14px",
-                borderRadius: 12,
-                border: "1px solid #fecaca",
-                background: "#fef2f2",
-                color: "#b91c1c",
-                fontSize: 14,
-              }}
-            >
-              {authError}
-            </div>
-          )}
+          <form onSubmit={handleAuthSubmit} className="space-y-4">
+            <input
+              type="email"
+              value={authEmail}
+              onChange={(e) => setAuthEmail(e.target.value)}
+              placeholder="Email"
+              className="w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm outline-none"
+            />
+            <input
+              type="password"
+              value={authPassword}
+              onChange={(e) => setAuthPassword(e.target.value)}
+              placeholder="Пароль"
+              className="w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm outline-none"
+            />
 
-          <form onSubmit={handleAuthSubmit}>
-            <div style={{ marginBottom: 12 }}>
-              <input
-                type="email"
-                placeholder="Email"
-                value={authEmail}
-                onChange={(e) => setAuthEmail(e.target.value)}
-                autoComplete="email"
-                style={{
-                  width: "100%",
-                  height: 48,
-                  borderRadius: 14,
-                  border: "1px solid #d1d5db",
-                  padding: "0 14px",
-                  fontSize: 15,
-                  outline: "none",
-                  boxSizing: "border-box",
-                }}
-              />
-            </div>
-
-            <div style={{ marginBottom: 18 }}>
-              <input
-                type="password"
-                placeholder="Пароль"
-                value={authPassword}
-                onChange={(e) => setAuthPassword(e.target.value)}
-                autoComplete={
-                  authMode === "login" ? "current-password" : "new-password"
-                }
-                style={{
-                  width: "100%",
-                  height: 48,
-                  borderRadius: 14,
-                  border: "1px solid #d1d5db",
-                  padding: "0 14px",
-                  fontSize: 15,
-                  outline: "none",
-                  boxSizing: "border-box",
-                }}
-              />
-            </div>
+            {authError && (
+              <div className="rounded-xl border border-red-900 bg-red-950 px-4 py-3 text-sm text-red-200">
+                {authError}
+              </div>
+            )}
 
             <button
               type="submit"
               disabled={authLoading}
-              style={{
-                width: "100%",
-                height: 50,
-                border: "none",
-                borderRadius: 16,
-                background: "#111827",
-                color: "#ffffff",
-                fontSize: 15,
-                fontWeight: 800,
-                cursor: authLoading ? "not-allowed" : "pointer",
-                opacity: authLoading ? 0.7 : 1,
-                boxShadow: "0 10px 24px rgba(17,24,39,0.18)",
-              }}
+              className="w-full rounded-xl bg-white px-4 py-3 text-sm font-semibold text-slate-900 transition hover:bg-slate-200 disabled:cursor-not-allowed disabled:opacity-50"
             >
               {authLoading
                 ? authMode === "login"
                   ? "Вход..."
                   : "Регистрация..."
                 : authMode === "login"
-                  ? "Войти"
-                  : "Зарегистрироваться"}
+                ? "Войти"
+                : "Зарегистрироваться"}
             </button>
           </form>
         </div>
@@ -1010,1369 +646,352 @@ export default function Chat() {
   }
 
   return (
-    <div
-      style={{
-        display: "flex",
-        height: "100vh",
-        background: "#f5f7fb",
-        color: "#111827",
-        fontFamily: "Inter, Arial, Helvetica, sans-serif",
-      }}
-    >
-      <aside
-        style={{
-          width: 320,
-          borderRight: "1px solid #e5e7eb",
-          background: "#ffffff",
-          display: "flex",
-          flexDirection: "column",
-        }}
-      >
-        <div
-          style={{
-            padding: 16,
-            borderBottom: "1px solid #e5e7eb",
-            background: "linear-gradient(135deg, #ffffff 0%, #f8fbff 100%)",
-          }}
-        >
-          <button
-            onClick={handleCreateChat}
-            disabled={creatingChat || loadingModels}
-            style={{
-              width: "100%",
-              padding: "12px 14px",
-              borderRadius: 12,
-              border: "none",
-              background: "#111827",
-              color: "#ffffff",
-              fontSize: 14,
-              fontWeight: 600,
-              cursor: creatingChat || loadingModels ? "not-allowed" : "pointer",
-              boxShadow: "0 6px 20px rgba(17,24,39,0.12)",
-              opacity: creatingChat || loadingModels ? 0.7 : 1,
-            }}
-          >
-            {creatingChat ? "Создание..." : "+ Новый чат"}
-          </button>
-
-          <div style={{ marginTop: 12 }}>
-            <div
-              style={{
-                fontSize: 12,
-                fontWeight: 700,
-                color: "#64748b",
-                marginBottom: 6,
-                textTransform: "uppercase",
-                letterSpacing: 0.4,
-              }}
-            >
-              Модель по умолчанию
+    <div className="flex h-screen bg-slate-950 text-white">
+      <aside className="flex w-80 flex-col border-r border-slate-800 bg-slate-900">
+        <div className="border-b border-slate-800 p-4">
+          <div className="mb-4 flex items-center justify-between">
+            <div>
+              <div className="text-sm text-slate-400">Аккаунт</div>
+              <div className="max-w-[180px] truncate text-sm font-semibold">
+                {authUser?.email}
+              </div>
             </div>
-
-            <select
-              value={selectedDefaultModelSlug}
-              onChange={(e) => setSelectedDefaultModelSlug(e.target.value)}
-              disabled={loadingModels}
-              style={{
-                width: "100%",
-                height: 42,
-                borderRadius: 12,
-                border: "1px solid #d1d5db",
-                background: "#ffffff",
-                padding: "0 12px",
-                fontSize: 14,
-                color: "#111827",
-                outline: "none",
-              }}
+            <button
+              type="button"
+              onClick={handleLogout}
+              className="rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:bg-slate-800"
             >
-              {models.map((model) => (
-                <option key={model.slug} value={model.slug}>
-                  {getModelLabel(model)}
-                </option>
-              ))}
-            </select>
-          </div>
-        </div>
-
-        <div
-          style={{
-            padding: "12px 16px",
-            borderBottom: "1px solid #e5e7eb",
-            background: "#ffffff",
-          }}
-        >
-          <div
-            style={{
-              fontSize: 12,
-              fontWeight: 700,
-              color: "#64748b",
-              textTransform: "uppercase",
-              letterSpacing: 0.4,
-              marginBottom: 6,
-            }}
-          >
-            Аккаунт
-          </div>
-
-          <div
-            style={{
-              fontSize: 14,
-              fontWeight: 600,
-              color: "#111827",
-              marginBottom: 10,
-              wordBreak: "break-word",
-            }}
-          >
-            {authUser?.email}
+              Выйти
+            </button>
           </div>
 
           <button
             type="button"
-            onClick={() => void handleLogout()}
-            style={{
-              width: "100%",
-              height: 40,
-              borderRadius: 12,
-              border: "1px solid #d1d5db",
-              background: "#ffffff",
-              color: "#111827",
-              fontSize: 14,
-              fontWeight: 600,
-              cursor: "pointer",
-            }}
+            onClick={handleCreateChat}
+            disabled={creatingChat}
+            className="mb-4 w-full rounded-xl bg-white px-4 py-3 text-sm font-semibold text-slate-900 hover:bg-slate-200 disabled:cursor-not-allowed disabled:opacity-50"
           >
-            Выйти
+            {creatingChat ? "Создание..." : "+ Новый чат"}
           </button>
+
+          <label className="mb-2 block text-xs uppercase tracking-wide text-slate-400">
+            Модель по умолчанию
+          </label>
+          <select
+            value={selectedDefaultModelSlug}
+            onChange={(e) => setSelectedDefaultModelSlug(e.target.value)}
+            className="w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm outline-none"
+          >
+            {models.map((model) => (
+              <option key={model.slug} value={model.slug}>
+                {getModelLabel(model)}
+              </option>
+            ))}
+          </select>
         </div>
 
-        <div
-          style={{
-            flex: 1,
-            overflowY: "auto",
-            padding: 12,
-          }}
-        >
-          {loadingChats && (
-            <div style={{ padding: 12, color: "#6b7280", fontSize: 14 }}>
+        <div className="flex-1 overflow-y-auto p-3">
+          {loadingChats ? (
+            <div className="rounded-xl border border-slate-800 bg-slate-950 p-4 text-sm text-slate-400">
               Загрузка чатов...
             </div>
-          )}
-
-          {!loadingChats && chats.length === 0 && (
-            <div
-              style={{
-                padding: 12,
-                color: "#6b7280",
-                fontSize: 14,
-                border: "1px dashed #d1d5db",
-                borderRadius: 12,
-                background: "#fafafa",
-              }}
-            >
+          ) : chats.length === 0 ? (
+            <div className="rounded-xl border border-slate-800 bg-slate-950 p-4 text-sm text-slate-400">
               Чатов пока нет
             </div>
+          ) : (
+            <div className="space-y-2">
+              {chats.map((chat) => {
+                const isActive = chat.id === selectedChatId;
+                return (
+                  <div
+                    key={chat.id}
+                    className={`rounded-xl border p-3 ${
+                      isActive
+                        ? "border-slate-500 bg-slate-800"
+                        : "border-slate-800 bg-slate-950"
+                    }`}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => handleSelectChat(chat.id)}
+                      className="mb-2 block w-full text-left"
+                    >
+                      <div className="truncate text-sm font-semibold">
+                        {chat.title}
+                      </div>
+                      <div className="mt-1 text-xs text-slate-400">
+                        {chat.model_slug}
+                      </div>
+                    </button>
+
+                    <div className="flex items-center gap-2">
+                      <select
+                        value={chat.model_slug}
+                        onChange={(e) =>
+                          void handleChangeChatModel(chat.id, e.target.value)
+                        }
+                        disabled={updatingModel}
+                        className="flex-1 rounded-lg border border-slate-700 bg-slate-900 px-2 py-2 text-xs outline-none"
+                      >
+                        {models.map((model) => (
+                          <option key={model.slug} value={model.slug}>
+                            {getModelLabel(model)}
+                          </option>
+                        ))}
+                      </select>
+
+                      <button
+                        type="button"
+                        onClick={() => void handleDeleteChat(chat.id)}
+                        disabled={deletingChatId === chat.id}
+                        className="rounded-lg border border-red-900 px-2 py-2 text-xs text-red-300 hover:bg-red-950 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {deletingChatId === chat.id ? "..." : "Удалить"}
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
           )}
-
-          {chats.map((chat) => {
-            const isActive = selectedChatId === chat.id;
-            const isDeleting = deletingChatId === chat.id;
-
-            return (
-              <div
-                key={chat.id}
-                style={{
-                  padding: 14,
-                  marginBottom: 10,
-                  border: isActive ? "1px solid #bfdbfe" : "1px solid #e5e7eb",
-                  borderRadius: 14,
-                  background: isActive ? "#eff6ff" : "#ffffff",
-                  boxShadow: isActive
-                    ? "0 8px 24px rgba(59,130,246,0.10)"
-                    : "0 2px 8px rgba(15,23,42,0.04)",
-                  transition: "all 0.2s ease",
-                }}
-              >
-                <div
-                  style={{
-                    display: "flex",
-                    gap: 10,
-                    alignItems: "flex-start",
-                    justifyContent: "space-between",
-                  }}
-                >
-                  <div
-                    onClick={() => void loadChatHistory(chat.id)}
-                    style={{
-                      flex: 1,
-                      minWidth: 0,
-                      cursor: "pointer",
-                    }}
-                  >
-                    <div
-                      style={{
-                        fontWeight: 700,
-                        fontSize: 15,
-                        lineHeight: 1.3,
-                        marginBottom: 6,
-                        wordBreak: "break-word",
-                      }}
-                    >
-                      {chat.title}
-                    </div>
-
-                    <div
-                      style={{
-                        display: "inline-flex",
-                        alignItems: "center",
-                        gap: 6,
-                        fontSize: 12,
-                        color: "#475569",
-                        background: "#f8fafc",
-                        padding: "4px 8px",
-                        borderRadius: 999,
-                      }}
-                    >
-                      <span
-                        style={{
-                          width: 8,
-                          height: 8,
-                          borderRadius: "50%",
-                          background:
-                            chat.model_slug?.includes("gpt") ? "#10b981" : "#6366f1",
-                          display: "inline-block",
-                        }}
-                      />
-                      {chat.model_slug}
-                    </div>
-                  </div>
-
-                  <div
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 6,
-                    }}
-                  >
-                    <button
-                      type="button"
-                      onClick={() => void handleRenameChat(chat.id, chat.title)}
-                      title="Переименовать чат"
-                      style={{
-                        border: "none",
-                        background: "transparent",
-                        color: "#475569",
-                        cursor: "pointer",
-                        fontSize: 15,
-                        lineHeight: 1,
-                        padding: 4,
-                      }}
-                    >
-                      ✎
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => void handleDeleteChat(chat.id)}
-                      disabled={isDeleting}
-                      title="Удалить чат"
-                      style={{
-                        border: "none",
-                        background: "transparent",
-                        color: "#ef4444",
-                        cursor: isDeleting ? "not-allowed" : "pointer",
-                        fontSize: 16,
-                        lineHeight: 1,
-                        padding: 4,
-                      }}
-                    >
-                      {isDeleting ? "…" : "✕"}
-                    </button>
-                  </div>
-                </div>
-              </div>
-            );
-          })}
         </div>
       </aside>
 
-      <main
-        style={{
-          flex: 1,
-          display: "flex",
-          flexDirection: "column",
-          minWidth: 0,
-        }}
-      >
-        <div
-          style={{
-            minHeight: 72,
-            borderBottom: "1px solid #e5e7eb",
-            background: "#ffffff",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            padding: "12px 20px",
-            gap: 16,
-            flexWrap: "wrap",
-          }}
-        >
-          <div style={{ minWidth: 0 }}>
-            <div
-              style={{
-                fontSize: 18,
-                fontWeight: 700,
-                color: "#111827",
-                whiteSpace: "nowrap",
-                overflow: "hidden",
-                textOverflow: "ellipsis",
-              }}
-            >
-              {selectedChat ? selectedChat.title : "AIChatUniversal"}
+      <main className="flex flex-1 flex-col">
+        <div className="border-b border-slate-800 bg-slate-900 px-6 py-4">
+          <div className="mb-3 flex items-center justify-between gap-4">
+            <div>
+              <div className="text-lg font-semibold">
+                {currentChat ? currentChat.title : "Выберите чат"}
+              </div>
+              <div className="text-sm text-slate-400">
+                {currentChat
+                  ? `Модель: ${currentChat.model_slug}`
+                  : "Создайте новый чат или выберите существующий"}
+              </div>
             </div>
 
-            <div
-              style={{
-                marginTop: 4,
-                fontSize: 13,
-                color: "#6b7280",
-              }}
-            >
-              {selectedChat
-                ? `Модель чата: ${selectedChat.model_slug}`
-                : "Выбери чат слева или создай новый"}
-            </div>
-          </div>
-
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 12,
-              flexWrap: "wrap",
-            }}
-          >
-            <div
-              style={{
-                display: "inline-flex",
-                alignItems: "center",
-                background: "#f3f4f6",
-                borderRadius: 12,
-                padding: 4,
-                gap: 4,
-              }}
-            >
+            <div className="flex rounded-xl border border-slate-800 bg-slate-950 p-1">
               <button
                 type="button"
                 onClick={() => setViewMode("chat")}
-                style={{
-                  height: 34,
-                  padding: "0 12px",
-                  border: "none",
-                  borderRadius: 10,
-                  background: viewMode === "chat" ? "#111827" : "transparent",
-                  color: viewMode === "chat" ? "#ffffff" : "#374151",
-                  fontSize: 14,
-                  fontWeight: 600,
-                  cursor: "pointer",
-                }}
+                className={`rounded-lg px-3 py-2 text-sm ${
+                  viewMode === "chat"
+                    ? "bg-white text-slate-900"
+                    : "text-slate-300"
+                }`}
               >
-                💬 Чат
+                Чат
               </button>
-
               <button
                 type="button"
                 onClick={() => setViewMode("image")}
-                style={{
-                  height: 34,
-                  padding: "0 12px",
-                  border: "none",
-                  borderRadius: 10,
-                  background: viewMode === "image" ? "#111827" : "transparent",
-                  color: viewMode === "image" ? "#ffffff" : "#374151",
-                  fontSize: 14,
-                  fontWeight: 600,
-                  cursor: "pointer",
-                }}
+                className={`rounded-lg px-3 py-2 text-sm ${
+                  viewMode === "image"
+                    ? "bg-white text-slate-900"
+                    : "text-slate-300"
+                }`}
               >
-                🎨 Изображение
+                Изображение
               </button>
             </div>
-
-            {selectedChat && (
-              <button
-                type="button"
-                onClick={() => void handleRenameChat(selectedChat.id, selectedChat.title)}
-                style={{
-                  height: 42,
-                  padding: "0 14px",
-                  border: "1px solid #d1d5db",
-                  borderRadius: 12,
-                  background: "#ffffff",
-                  color: "#111827",
-                  fontSize: 14,
-                  fontWeight: 600,
-                  cursor: "pointer",
-                }}
-              >
-                ✏ Переименовать
-              </button>
-            )}
-
-            {selectedChat && viewMode === "chat" && (
-              <>
-                <button
-                  type="button"
-                  onClick={() => void handleCopyChat()}
-                  style={{
-                    height: 42,
-                    padding: "0 14px",
-                    border: "1px solid #d1d5db",
-                    borderRadius: 12,
-                    background: "#ffffff",
-                    color: "#111827",
-                    fontSize: 14,
-                    fontWeight: 600,
-                    cursor: "pointer",
-                  }}
-                >
-                  📋 Копировать чат
-                </button>
-
-                <button
-                  type="button"
-                  onClick={handleDownloadChat}
-                  style={{
-                    height: 42,
-                    padding: "0 14px",
-                    border: "1px solid #d1d5db",
-                    borderRadius: 12,
-                    background: "#ffffff",
-                    color: "#111827",
-                    fontSize: 14,
-                    fontWeight: 600,
-                    cursor: "pointer",
-                  }}
-                >
-                  ⬇ Скачать .md
-                </button>
-
-                <div>
-                  <div
-                    style={{
-                      fontSize: 12,
-                      fontWeight: 700,
-                      color: "#64748b",
-                      marginBottom: 6,
-                      textTransform: "uppercase",
-                      letterSpacing: 0.4,
-                    }}
-                  >
-                    Модель текущего чата
-                  </div>
-
-                  <select
-                    value={selectedChat.model_slug}
-                    onChange={(e) => void handleChangeChatModel(e.target.value)}
-                    disabled={updatingModel || loadingModels}
-                    style={{
-                      minWidth: 240,
-                      height: 42,
-                      borderRadius: 12,
-                      border: "1px solid #d1d5db",
-                      background: "#ffffff",
-                      padding: "0 12px",
-                      fontSize: 14,
-                      color: "#111827",
-                      outline: "none",
-                    }}
-                  >
-                    {models.map((model) => (
-                      <option key={model.slug} value={model.slug}>
-                        {getModelLabel(model)}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              </>
-            )}
           </div>
+
+          {errorText && (
+            <div className="rounded-xl border border-red-900 bg-red-950 px-4 py-3 text-sm text-red-200">
+              {errorText}
+            </div>
+          )}
+
+          {warningText && (
+            <div className="mt-2 rounded-xl border border-amber-900 bg-amber-950 px-4 py-3 text-sm text-amber-200">
+              {warningText}
+            </div>
+          )}
+
+          {copiedText && (
+            <div className="mt-2 rounded-xl border border-emerald-900 bg-emerald-950 px-4 py-3 text-sm text-emerald-200">
+              {copiedText}
+            </div>
+          )}
         </div>
 
-        {copiedText && (
-          <div
-            style={{
-              margin: "16px 20px 0",
-              padding: "12px 14px",
-              borderRadius: 12,
-              border: "1px solid #bbf7d0",
-              background: "#f0fdf4",
-              color: "#166534",
-              fontSize: 14,
-            }}
-          >
-            {copiedText}
-          </div>
-        )}
-
-        {warningText && (
-          <div
-            style={{
-              margin: "16px 20px 0",
-              padding: "12px 14px",
-              borderRadius: 12,
-              border: "1px solid #fde68a",
-              background: "#fffbeb",
-              color: "#92400e",
-              fontSize: 14,
-            }}
-          >
-            {warningText}
-          </div>
-        )}
-
-        {errorText && (
-          <div
-            style={{
-              margin: "16px 20px 0",
-              padding: "12px 14px",
-              borderRadius: 12,
-              border: "1px solid #fecaca",
-              background: "#fef2f2",
-              color: "#b91c1c",
-              fontSize: 14,
-            }}
-          >
-            {errorText}
-          </div>
-        )}
-
-        {viewMode === "chat" && selectedChatId && (
-          <div
-            style={{
-              padding: "12px 20px",
-              borderBottom: "1px solid #eef2f7",
-              background: "#fcfdff",
-            }}
-          >
-            <div
-              style={{
-                fontSize: 13,
-                fontWeight: 700,
-                color: "#475569",
-                marginBottom: 8,
-              }}
-            >
-              Вложения чата
-            </div>
-
-            {loadingAttachments ? (
-              <div style={{ fontSize: 13, color: "#6b7280" }}>
-                Загрузка вложений...
-              </div>
-            ) : attachments.length === 0 ? (
-              <div style={{ fontSize: 13, color: "#94a3b8" }}>
-                Пока нет вложений
-              </div>
-            ) : (
-              <div
-                style={{
-                  display: "flex",
-                  flexWrap: "wrap",
-                  gap: 8,
-                }}
-              >
-                {attachments.map((attachment) => {
-                  const isDeletingAttachment = deletingAttachmentId === attachment.id;
-
-                  return (
+        <div className="flex flex-1 overflow-hidden">
+          <section className="flex flex-1 flex-col">
+            <div className="flex-1 overflow-y-auto px-6 py-4">
+              {loadingMessages ? (
+                <div className="text-sm text-slate-400">Загрузка сообщений...</div>
+              ) : messages.length === 0 ? (
+                <div className="text-sm text-slate-400">
+                  Сообщений пока нет
+                </div>
+              ) : (
+                <div className="space-y-4">
+                  {messages.map((item) => (
                     <div
-                      key={attachment.id}
-                      style={{
-                        display: "flex",
-                        alignItems: "flex-start",
-                        gap: 8,
-                        padding: "8px 10px",
-                        borderRadius: 10,
-                        border: "1px solid #dbeafe",
-                        background: "#eff6ff",
-                        fontSize: 12,
-                        color: "#1e3a8a",
-                      }}
+                      key={item.id}
+                      className={`max-w-3xl rounded-2xl border p-4 ${
+                        item.role === "user"
+                          ? "ml-auto border-slate-700 bg-slate-800"
+                          : "border-slate-800 bg-slate-900"
+                      }`}
                     >
-                      <div>
-                        <div style={{ fontWeight: 600 }}>
-                          {attachment.original_name ||
-                            attachment.file_name ||
-                            `Файл #${attachment.id}`}
-                        </div>
-                        <div style={{ marginTop: 4, color: "#64748b" }}>
-                          status: {attachment.parse_status || "unknown"}
-                        </div>
+                      <div className="mb-2 text-xs uppercase tracking-wide text-slate-400">
+                        {item.role}
                       </div>
 
-                      <button
-                        type="button"
-                        onClick={() => void handleDeleteAttachment(attachment.id)}
-                        disabled={isDeletingAttachment}
-                        title="Удалить файл"
-                        style={{
-                          border: "none",
-                          background: "transparent",
-                          color: "#ef4444",
-                          cursor: isDeletingAttachment ? "not-allowed" : "pointer",
-                          fontSize: 15,
-                          lineHeight: 1,
-                          padding: 2,
-                        }}
-                      >
-                        {isDeletingAttachment ? "…" : "✕"}
-                      </button>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-        )}
-
-        {viewMode === "chat" && (
-          <>
-            <div
-              style={{
-                flex: 1,
-                overflowY: "auto",
-                padding: "20px 20px 12px",
-                background:
-                  "radial-gradient(circle at top, #f8fbff 0%, #f5f7fb 45%, #f5f7fb 100%)",
-              }}
-            >
-              {!selectedChatId && (
-                <div
-                  style={{
-                    height: "100%",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                  }}
-                >
-                  <div
-                    style={{
-                      maxWidth: 520,
-                      textAlign: "center",
-                      padding: 24,
-                      borderRadius: 20,
-                      border: "1px solid #e5e7eb",
-                      background: "#ffffff",
-                      boxShadow: "0 10px 30px rgba(15,23,42,0.06)",
-                    }}
-                  >
-                    <div
-                      style={{
-                        fontSize: 20,
-                        fontWeight: 700,
-                        marginBottom: 10,
-                      }}
-                    >
-                      Добро пожаловать в AIChatUniversal
-                    </div>
-                    <div
-                      style={{
-                        color: "#6b7280",
-                        lineHeight: 1.6,
-                        fontSize: 14,
-                      }}
-                    >
-                      Выбери существующий чат слева или создай новый, чтобы начать
-                      диалог.
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              {selectedChatId && loadingMessages && (
-                <div
-                  style={{
-                    display: "flex",
-                    flexDirection: "column",
-                    gap: 12,
-                  }}
-                >
-                  {[1, 2, 3].map((item) => (
-                    <div
-                      key={item}
-                      style={{
-                        display: "flex",
-                        gap: 12,
-                        alignItems: "flex-start",
-                      }}
-                    >
-                      <div
-                        style={{
-                          width: 36,
-                          height: 36,
-                          borderRadius: "50%",
-                          background: "#e5e7eb",
-                          flexShrink: 0,
-                        }}
-                      />
-                      <div
-                        style={{
-                          height: 64,
-                          width: item % 2 === 0 ? "55%" : "72%",
-                          borderRadius: 18,
-                          background: "#e5e7eb",
-                        }}
-                      />
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {selectedChatId &&
-                !loadingMessages &&
-                messages.map((msg) => {
-                  const isUser = msg.role === "user";
-                  const hasImage = Boolean(msg.image_url);
-                  const hasText = Boolean(msg.content?.trim());
-
-                  return (
-                    <div
-                      key={msg.id}
-                      style={{
-                        display: "flex",
-                        justifyContent: isUser ? "flex-end" : "flex-start",
-                        marginBottom: 16,
-                      }}
-                    >
-                      <div
-                        style={{
-                          display: "flex",
-                          flexDirection: isUser ? "row-reverse" : "row",
-                          alignItems: "flex-start",
-                          gap: 10,
-                          maxWidth: hasImage ? "84%" : "78%",
-                        }}
-                      >
-                        <div
-                          style={{
-                            width: 38,
-                            height: 38,
-                            borderRadius: "50%",
-                            display: "flex",
-                            alignItems: "center",
-                            justifyContent: "center",
-                            fontSize: 14,
-                            fontWeight: 700,
-                            color: "#ffffff",
-                            background: isUser ? "#3b82f6" : "#111827",
-                            flexShrink: 0,
-                            boxShadow: "0 6px 18px rgba(15,23,42,0.12)",
-                          }}
-                        >
-                          {isUser ? "U" : "AI"}
+                      {item.image_url ? (
+                        <div className="space-y-3">
+                          <img
+                            src={normalizeImageUrl(item.image_url) || ""}
+                            alt="generated"
+                            className="max-h-[420px] rounded-xl border border-slate-800"
+                          />
+                          {item.content ? (
+                            <div className="whitespace-pre-wrap text-sm leading-6 text-slate-100">
+                              {item.content}
+                            </div>
+                          ) : null}
                         </div>
-
-                        <div
-                          style={{
-                            background: isUser ? "#dbeafe" : "#ffffff",
-                            color: "#111827",
-                            border: isUser
-                              ? "1px solid #bfdbfe"
-                              : "1px solid #e5e7eb",
-                            borderRadius: 20,
-                            padding: "12px 14px",
-                            boxShadow: "0 6px 18px rgba(15,23,42,0.05)",
-                            minWidth: hasImage ? 260 : 120,
-                          }}
-                        >
-                          <div
-                            style={{
-                              display: "flex",
-                              alignItems: "center",
-                              justifyContent: "space-between",
-                              gap: 12,
-                              marginBottom: 8,
-                            }}
-                          >
-                            <div
-                              style={{
-                                display: "flex",
-                                alignItems: "center",
-                                gap: 10,
-                              }}
-                            >
-                              <div
-                                style={{
-                                  fontSize: 12,
-                                  fontWeight: 700,
-                                  color: isUser ? "#1d4ed8" : "#6b7280",
-                                  textTransform: "uppercase",
-                                  letterSpacing: 0.4,
-                                }}
-                              >
-                                {isUser ? "user" : "assistant"}
-                              </div>
-
-                              {(hasText || hasImage) && (
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    void copyToClipboard(
-                                      hasText
-                                        ? msg.content
-                                        : msg.image_url || "",
-                                      "Сообщение скопировано"
-                                    )
-                                  }
-                                  title="Скопировать сообщение"
-                                  style={{
-                                    border: "none",
-                                    background: "transparent",
-                                    cursor: "pointer",
-                                    fontSize: 12,
-                                    color: "#6b7280",
-                                    padding: 0,
-                                  }}
-                                >
-                                  📋
-                                </button>
-                              )}
-                            </div>
-
-                            <div
-                              style={{
-                                fontSize: 11,
-                                color: "#9ca3af",
-                                whiteSpace: "nowrap",
-                              }}
-                            >
-                              {formatTime(msg.created_at)}
-                            </div>
-                          </div>
-
-                          {hasText && (
-                            <div
-                              style={{
-                                fontSize: 15,
-                                lineHeight: 1.65,
-                                whiteSpace: "pre-wrap",
-                                wordBreak: "break-word",
-                                marginBottom: hasImage ? 12 : 0,
-                              }}
-                            >
-                              {msg.content}
-                            </div>
-                          )}
-
-                          {hasImage && (
-                            <div>
-                              <img
-                                src={msg.image_url || ""}
-                                alt="Generated image"
-                                style={{
-                                  width: "100%",
-                                  maxWidth: 520,
-                                  borderRadius: 16,
-                                  display: "block",
-                                  border: "1px solid #e5e7eb",
-                                }}
-                              />
-                              <div
-                                style={{
-                                  marginTop: 8,
-                                  fontSize: 12,
-                                  color: "#6b7280",
-                                }}
-                              >
-                                Сгенерированное изображение
-                              </div>
-                            </div>
-                          )}
-
-                          {!isUser && (msg.model_slug || msg.provider_slug) && (
-                            <div
-                              style={{
-                                marginTop: 10,
-                                paddingTop: 10,
-                                borderTop: "1px solid #f3f4f6",
-                                fontSize: 12,
-                                color: "#6b7280",
-                              }}
-                            >
-                              {msg.model_slug ? `model: ${msg.model_slug}` : ""}
-                              {msg.model_slug && msg.provider_slug ? " • " : ""}
-                              {msg.provider_slug
-                                ? `provider: ${msg.provider_slug}`
-                                : ""}
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                  );
-                })}
-
-              {sending && (
-                <div
-                  style={{
-                    display: "flex",
-                    justifyContent: "flex-start",
-                    marginBottom: 16,
-                  }}
-                >
-                  <div
-                    style={{
-                      display: "flex",
-                      alignItems: "flex-start",
-                      gap: 10,
-                      maxWidth: "78%",
-                    }}
-                  >
-                    <div
-                      style={{
-                        width: 38,
-                        height: 38,
-                        borderRadius: "50%",
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "center",
-                        fontSize: 14,
-                        fontWeight: 700,
-                        color: "#ffffff",
-                        background: "#111827",
-                        flexShrink: 0,
-                        boxShadow: "0 6px 18px rgba(15,23,42,0.12)",
-                      }}
-                    >
-                      AI
-                    </div>
-
-                    <div
-                      style={{
-                        background: "#ffffff",
-                        border: "1px solid #e5e7eb",
-                        borderRadius: 20,
-                        padding: "14px 16px",
-                        boxShadow: "0 6px 18px rgba(15,23,42,0.05)",
-                      }}
-                    >
-                      <div
-                        style={{
-                          display: "flex",
-                          alignItems: "center",
-                          gap: 8,
-                        }}
-                      >
-                        <span
-                          style={{
-                            width: 8,
-                            height: 8,
-                            borderRadius: "50%",
-                            background: "#9ca3af",
-                            display: "inline-block",
-                          }}
-                        />
-                        <span
-                          style={{
-                            width: 8,
-                            height: 8,
-                            borderRadius: "50%",
-                            background: "#9ca3af",
-                            display: "inline-block",
-                          }}
-                        />
-                        <span
-                          style={{
-                            width: 8,
-                            height: 8,
-                            borderRadius: "50%",
-                            background: "#9ca3af",
-                            display: "inline-block",
-                          }}
-                        />
-                        <span
-                          style={{
-                            fontSize: 14,
-                            color: "#6b7280",
-                            marginLeft: 4,
-                          }}
-                        >
-                          Печатает...
-                        </span>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              <div ref={messagesEndRef} />
-            </div>
-
-            <div
-              style={{
-                borderTop: "1px solid #e5e7eb",
-                background: "#ffffff",
-                padding: 16,
-              }}
-            >
-              <div
-                style={{
-                  maxWidth: 980,
-                  margin: "0 auto",
-                }}
-              >
-                {selectedChatId && (
-                  <div style={{ marginBottom: 12 }}>
-                    <div
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 10,
-                        flexWrap: "wrap",
-                        marginBottom: 10,
-                      }}
-                    >
-                      <input
-                        ref={fileInputRef}
-                        type="file"
-                        multiple
-                        onChange={handleFilesChange}
-                        style={{ display: "none" }}
-                      />
-
-                      <button
-                        type="button"
-                        onClick={() => fileInputRef.current?.click()}
-                        disabled={sending || uploadingFiles}
-                        style={{
-                          height: 42,
-                          padding: "0 14px",
-                          border: "1px solid #d1d5db",
-                          borderRadius: 12,
-                          background: "#ffffff",
-                          color: "#111827",
-                          fontSize: 14,
-                          fontWeight: 600,
-                          cursor:
-                            sending || uploadingFiles ? "not-allowed" : "pointer",
-                        }}
-                      >
-                        📎 Прикрепить файлы
-                      </button>
-
-                      {selectedFilesInfo.total > 0 && (
-                        <div
-                          style={{
-                            fontSize: 13,
-                            color: "#475569",
-                          }}
-                        >
-                          Выбрано: {selectedFilesInfo.total} · изображений:{" "}
-                          {selectedFilesInfo.images} · других файлов:{" "}
-                          {selectedFilesInfo.nonImages}
+                      ) : (
+                        <div className="whitespace-pre-wrap text-sm leading-6 text-slate-100">
+                          {item.content}
                         </div>
                       )}
+
+                      <div className="mt-3 flex justify-end">
+                        <button
+                          type="button"
+                          onClick={() => void copyText(item.content || "")}
+                          className="rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:bg-slate-800"
+                        >
+                          Копировать
+                        </button>
+                      </div>
                     </div>
+                  ))}
+                  <div ref={messagesEndRef} />
+                </div>
+              )}
+            </div>
+
+            <div className="border-t border-slate-800 bg-slate-900 px-6 py-4">
+              {viewMode === "chat" ? (
+                <div className="space-y-3">
+                  <div className="flex items-end gap-3">
+                    <textarea
+                      value={message}
+                      onChange={(e) => setMessage(e.target.value)}
+                      placeholder="Введите сообщение..."
+                      rows={3}
+                      className="min-h-[90px] flex-1 resize-none rounded-2xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm outline-none"
+                    />
+                    <button
+                      type="button"
+                      onClick={handleSendMessage}
+                      disabled={!selectedChatId || sending || !message.trim()}
+                      className="rounded-2xl bg-white px-5 py-3 text-sm font-semibold text-slate-900 hover:bg-slate-200 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {sending ? "Отправка..." : "Отправить"}
+                    </button>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-3">
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      multiple
+                      onChange={(e) => void handleFileChange(e)}
+                      className="block text-sm text-slate-300"
+                    />
+                    <button
+                      type="button"
+                      onClick={handleUploadFiles}
+                      disabled={
+                        !selectedChatId ||
+                        uploadingFiles ||
+                        selectedFiles.length === 0
+                      }
+                      className="rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {uploadingFiles ? "Загрузка..." : "Загрузить файлы"}
+                    </button>
 
                     {selectedFiles.length > 0 && (
-                      <div
-                        style={{
-                          display: "flex",
-                          flexWrap: "wrap",
-                          gap: 8,
-                        }}
-                      >
-                        {selectedFiles.map((file, index) => (
-                          <div
-                            key={`${file.name}-${file.lastModified}-${index}`}
-                            style={{
-                              display: "flex",
-                              alignItems: "center",
-                              gap: 8,
-                              padding: "8px 10px",
-                              borderRadius: 10,
-                              border: "1px solid #e5e7eb",
-                              background: "#f8fafc",
-                              fontSize: 12,
-                              color: "#334155",
-                            }}
-                          >
-                            <span>{file.name}</span>
-                            <button
-                              type="button"
-                              onClick={() => removeSelectedFile(index)}
-                              disabled={sending || uploadingFiles}
-                              style={{
-                                border: "none",
-                                background: "transparent",
-                                cursor:
-                                  sending || uploadingFiles
-                                    ? "not-allowed"
-                                    : "pointer",
-                                color: "#ef4444",
-                                fontWeight: 700,
-                              }}
-                            >
-                              ×
-                            </button>
-                          </div>
-                        ))}
+                      <div className="text-sm text-slate-400">
+                        Выбрано файлов: {selectedFiles.length}
                       </div>
                     )}
                   </div>
-                )}
-
-                <div
-                  style={{
-                    display: "flex",
-                    gap: 12,
-                    alignItems: "flex-end",
-                  }}
-                >
-                  <div style={{ flex: 1 }}>
-                    <textarea
-                      placeholder={
-                        selectedChatId
-                          ? "Введите сообщение..."
-                          : "Сначала выберите чат"
-                      }
-                      value={message}
-                      disabled={!selectedChatId || sending || uploadingFiles}
-                      onChange={(e) => setMessage(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter" && !e.shiftKey) {
-                          e.preventDefault();
-                          void handleSendMessage();
-                        }
-                      }}
-                      rows={1}
-                      style={{
-                        width: "100%",
-                        minHeight: 54,
-                        maxHeight: 180,
-                        resize: "vertical",
-                        padding: "14px 16px",
-                        border: "1px solid #d1d5db",
-                        borderRadius: 16,
-                        outline: "none",
-                        fontSize: 15,
-                        lineHeight: 1.5,
-                        background:
-                          !selectedChatId || sending || uploadingFiles
-                            ? "#f9fafb"
-                            : "#ffffff",
-                        color: "#111827",
-                        boxSizing: "border-box",
-                      }}
-                    />
-                  </div>
-
-                  <button
-                    onClick={() => void handleSendMessage()}
-                    disabled={
-                      !selectedChatId ||
-                      sending ||
-                      uploadingFiles ||
-                      (!message.trim() && selectedFiles.length === 0)
-                    }
-                    style={{
-                      height: 54,
-                      minWidth: 130,
-                      border: "none",
-                      borderRadius: 16,
-                      background:
-                        !selectedChatId ||
-                        sending ||
-                        uploadingFiles ||
-                        (!message.trim() && selectedFiles.length === 0)
-                          ? "#d1d5db"
-                          : "#111827",
-                      color: "#ffffff",
-                      fontSize: 14,
-                      fontWeight: 700,
-                      cursor:
-                        !selectedChatId ||
-                        sending ||
-                        uploadingFiles ||
-                        (!message.trim() && selectedFiles.length === 0)
-                          ? "not-allowed"
-                          : "pointer",
-                      boxShadow:
-                        !selectedChatId ||
-                        sending ||
-                        uploadingFiles ||
-                        (!message.trim() && selectedFiles.length === 0)
-                          ? "none"
-                          : "0 8px 20px rgba(17,24,39,0.16)",
-                    }}
-                  >
-                    {uploadingFiles
-                      ? "Загрузка..."
-                      : sending
-                        ? "Отправка..."
-                        : "Отправить"}
-                  </button>
                 </div>
-              </div>
-            </div>
-          </>
-        )}
-
-        {viewMode === "image" && (
-          <div
-            style={{
-              flex: 1,
-              overflowY: "auto",
-              padding: "20px",
-              background:
-                "radial-gradient(circle at top, #f8fbff 0%, #f5f7fb 45%, #f5f7fb 100%)",
-            }}
-          >
-            <div
-              style={{
-                maxWidth: 1100,
-                margin: "0 auto",
-              }}
-            >
-              <div
-                style={{
-                  border: "1px solid #e5e7eb",
-                  borderRadius: 20,
-                  background: "#ffffff",
-                  padding: 20,
-                  boxShadow: "0 10px 30px rgba(15,23,42,0.06)",
-                  marginBottom: 20,
-                }}
-              >
-                <div
-                  style={{
-                    fontSize: 22,
-                    fontWeight: 700,
-                    marginBottom: 8,
-                  }}
-                >
-                  Генерация изображений
-                </div>
-
-                <div
-                  style={{
-                    fontSize: 14,
-                    color: "#6b7280",
-                    marginBottom: 16,
-                    lineHeight: 1.6,
-                  }}
-                >
-                  Изображение будет сохранено в текущий чат и появится в истории
-                  сообщений.
-                </div>
-
-                <textarea
-                  value={imagePrompt}
-                  onChange={(e) => setImagePrompt(e.target.value)}
-                  placeholder="Например: futuristic robot in neon city, cinematic lighting"
-                  rows={4}
-                  style={{
-                    width: "100%",
-                    resize: "vertical",
-                    minHeight: 100,
-                    padding: "14px 16px",
-                    border: "1px solid #d1d5db",
-                    borderRadius: 16,
-                    outline: "none",
-                    fontSize: 15,
-                    lineHeight: 1.5,
-                    boxSizing: "border-box",
-                  }}
-                />
-
-                <div
-                  style={{
-                    marginTop: 16,
-                    display: "flex",
-                    gap: 12,
-                    flexWrap: "wrap",
-                  }}
-                >
+              ) : (
+                <div className="flex items-end gap-3">
+                  <textarea
+                    value={imagePrompt}
+                    onChange={(e) => setImagePrompt(e.target.value)}
+                    placeholder="Опишите изображение..."
+                    rows={3}
+                    className="min-h-[90px] flex-1 resize-none rounded-2xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm outline-none"
+                  />
                   <button
                     type="button"
-                    onClick={() => void handleGenerateImage()}
-                    disabled={generatingImage || !imagePrompt.trim() || !selectedChatId}
-                    style={{
-                      height: 46,
-                      padding: "0 18px",
-                      border: "none",
-                      borderRadius: 14,
-                      background:
-                        generatingImage || !imagePrompt.trim() || !selectedChatId
-                          ? "#d1d5db"
-                          : "#111827",
-                      color: "#ffffff",
-                      fontSize: 14,
-                      fontWeight: 700,
-                      cursor:
-                        generatingImage || !imagePrompt.trim() || !selectedChatId
-                          ? "not-allowed"
-                          : "pointer",
-                    }}
+                    onClick={handleGenerateImage}
+                    disabled={!selectedChatId || generatingImage || !imagePrompt.trim()}
+                    className="rounded-2xl bg-white px-5 py-3 text-sm font-semibold text-slate-900 hover:bg-slate-200 disabled:cursor-not-allowed disabled:opacity-50"
                   >
                     {generatingImage ? "Генерация..." : "Сгенерировать"}
                   </button>
-
-                  <button
-                    type="button"
-                    onClick={() => setImagePrompt("")}
-                    disabled={generatingImage || !imagePrompt}
-                    style={{
-                      height: 46,
-                      padding: "0 18px",
-                      border: "1px solid #d1d5db",
-                      borderRadius: 14,
-                      background: "#ffffff",
-                      color: "#111827",
-                      fontSize: 14,
-                      fontWeight: 600,
-                      cursor:
-                        generatingImage || !imagePrompt
-                          ? "not-allowed"
-                          : "pointer",
-                    }}
-                  >
-                    Очистить
-                  </button>
                 </div>
-
-                {!selectedChatId && (
-                  <div
-                    style={{
-                      marginTop: 12,
-                      fontSize: 13,
-                      color: "#92400e",
-                      background: "#fffbeb",
-                      border: "1px solid #fde68a",
-                      padding: "10px 12px",
-                      borderRadius: 12,
-                    }}
-                  >
-                    Сначала выбери чат слева. Изображение будет сохранено именно в него.
-                  </div>
-                )}
-              </div>
-
-              <div
-                style={{
-                  border: "1px dashed #d1d5db",
-                  borderRadius: 20,
-                  background: "#ffffff",
-                  padding: 28,
-                  textAlign: "center",
-                  color: "#6b7280",
-                }}
-              >
-                После генерации изображение автоматически появится в истории чата.
-              </div>
+              )}
             </div>
-          </div>
-        )}
+          </section>
+
+          <aside className="w-80 border-l border-slate-800 bg-slate-900 p-4">
+            <div className="mb-3 text-sm font-semibold">Файлы чата</div>
+
+            {loadingAttachments ? (
+              <div className="text-sm text-slate-400">Загрузка файлов...</div>
+            ) : attachments.length === 0 ? (
+              <div className="text-sm text-slate-400">Файлы не загружены</div>
+            ) : (
+              <div className="space-y-3">
+                {attachments.map((attachment) => (
+                  <div
+                    key={attachment.id}
+                    className="rounded-xl border border-slate-800 bg-slate-950 p-3"
+                  >
+                    <div className="break-words text-sm font-medium text-slate-100">
+                      {attachment.original_name || attachment.file_name || `Файл #${attachment.id}`}
+                    </div>
+
+                    <div className="mt-1 text-xs text-slate-400">
+                      {attachment.mime_type || "unknown"} ·{" "}
+                      {attachment.size_bytes ?? 0} bytes
+                    </div>
+
+                    <div className="mt-1 text-xs text-slate-500">
+                      status: {attachment.parse_status || "unknown"}
+                    </div>
+
+                    <div className="mt-3 flex justify-end">
+                      <button
+                        type="button"
+                        onClick={() => void handleDeleteAttachment(attachment.id)}
+                        disabled={deletingAttachmentId === attachment.id}
+                        className="rounded-lg border border-red-900 px-3 py-2 text-xs text-red-300 hover:bg-red-950 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {deletingAttachmentId === attachment.id
+                          ? "Удаление..."
+                          : "Удалить"}
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </aside>
+        </div>
       </main>
     </div>
   );
