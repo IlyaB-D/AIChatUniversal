@@ -18,11 +18,6 @@ export type RegisterPayload = {
   password: string;
 };
 
-export type AuthResponse = {
-  access_token: string;
-  token_type: string;
-};
-
 export type UserMe = {
   id: number;
   email: string;
@@ -30,21 +25,32 @@ export type UserMe = {
   total_spent_usd?: number;
   spending_limit_usd?: number;
   billing_enabled?: boolean;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type AuthResponse = {
+  access_token: string;
+  token_type: string;
+  user?: UserMe;
 };
 
 export type ModelItem = {
   id?: number;
   slug: string;
   name: string;
+  provider?: string | null;
   provider_slug?: string | null;
   modality?: string | null;
   supports_vision?: boolean;
   supports_files?: boolean;
   is_default?: boolean;
+  is_active?: boolean;
 };
 
 export type ChatItem = {
   id: number;
+  user_id?: number;
   title: string;
   model_slug: string;
   system_prompt?: string | null;
@@ -103,22 +109,12 @@ export type SendMessagePayload = {
   model_slug?: string;
 };
 
-export type UploadAttachmentResponse = {
-  id: number;
-  original_name: string;
-  mime_type?: string | null;
-  size_bytes?: number | null;
-  parse_status?: string | null;
-  extracted_text?: string | null;
-  chat_id?: number | null;
-  message_id?: number | null;
-  created_at?: string;
-};
-
 export type GenerateImageResponse = {
-  image_url: string;
-  prompt?: string;
-  message_id?: number;
+  image_url?: string;
+  message?: MessageItem | Record<string, unknown>;
+  assistant_message?: MessageItem | Record<string, unknown>;
+  item?: MessageItem | Record<string, unknown>;
+  [key: string]: unknown;
 };
 
 export function setAuthToken(token: string | null): void {
@@ -179,7 +175,7 @@ export async function getChats(): Promise<ChatItem[]> {
 }
 
 export async function createChat(payload: CreateChatPayload): Promise<ChatItem> {
-  const { data } = await api.post<ChatItem>("/chats", payload);
+  const { data } = await api.post<ChatItem>("/chat/create", payload);
   return data;
 }
 
@@ -207,8 +203,31 @@ export async function getHistory(chatId: number): Promise<MessageItem[]> {
 
 export async function sendMessage(
   payload: SendMessagePayload
-): Promise<MessageItem> {
-  const { data } = await api.post<MessageItem>("/chat", payload);
+): Promise<MessageItem | Record<string, unknown> | string> {
+  const { data } = await api.post("/chat/send", payload);
+  return data;
+}
+
+export async function sendMessageWithAttachment(payload: {
+  chat_id: number;
+  message: string;
+  model_slug?: string;
+  file: File;
+}): Promise<MessageItem | Record<string, unknown> | string> {
+  const formData = new FormData();
+  formData.append("chat_id", String(payload.chat_id));
+  formData.append("message", payload.message);
+  if (payload.model_slug) {
+    formData.append("model_slug", payload.model_slug);
+  }
+  formData.append("file", payload.file);
+
+  const { data } = await api.post("/chat/send-with-attachment", formData, {
+    headers: {
+      "Content-Type": "multipart/form-data",
+    },
+  });
+
   return data;
 }
 
@@ -222,33 +241,19 @@ export async function getAttachments(chatId: number): Promise<AttachmentItem[]> 
   return data.items ?? [];
 }
 
-export async function uploadAttachment(
-  chatId: number,
-  file: File
-): Promise<UploadAttachmentResponse> {
-  const formData = new FormData();
-  formData.append("chat_id", String(chatId));
-  formData.append("file", file);
-
-  const { data } = await api.post<UploadAttachmentResponse>(
-    "/attachments/upload",
-    formData,
-    {
-      headers: {
-        "Content-Type": "multipart/form-data",
-      },
-    }
-  );
-
-  return data;
+export async function deleteAttachment(attachmentId: number): Promise<void> {
+  await api.delete(`/attachments/${attachmentId}`);
 }
 
-export async function generateImage(
-  prompt: string,
-  chatId: number
-): Promise<GenerateImageResponse> {
-  const { data } = await api.post<GenerateImageResponse>(
-    `/images/generate?prompt=${encodeURIComponent(prompt)}&chat_id=${chatId}`
-  );
+export async function generateImage(payload: {
+  prompt: string;
+  chat_id: number;
+}): Promise<GenerateImageResponse | Record<string, unknown> | string> {
+  const { data } = await api.post("/images/generate", null, {
+    params: {
+      prompt: payload.prompt,
+      chat_id: payload.chat_id,
+    },
+  });
   return data;
 }

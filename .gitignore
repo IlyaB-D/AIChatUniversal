@@ -18,3 +18,10 @@ frontend/.env.production
 # OS
 .DS_Store
 Thumbs.db
+
+# storage (ВАЖНО)
+backend/storage/generated/
+backend/storage/uploads/
+
+# backups
+frontend/_old_src_backup/

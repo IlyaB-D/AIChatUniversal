@@ -1,91 +1,95 @@
 "use client";
 
 import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
-import { api, initAuthToken, setAuthToken } from "@/lib/api";
+import {
+  AttachmentItem,
+  ChatItem,
+  MessageItem,
+  ModelItem,
+  UserMe,
+  createChat,
+  deleteAttachment,
+  deleteChat,
+  generateImage,
+  getAttachments,
+  getChats,
+  getHistory,
+  getMe,
+  getModels,
+  initAuthToken,
+  login,
+  register,
+  sendMessage,
+  sendMessageWithAttachment,
+  setAuthToken,
+  updateChat,
+} from "@/lib/api";
 
-type ChatItem = {
-  id: number;
-  title: string;
-  model_slug: string;
-  system_prompt?: string | null;
-  created_at?: string;
-  updated_at?: string;
-};
-
-type MessageItem = {
-  id: number;
-  chat_id: number;
-  role: string;
-  content: string;
-  image_url?: string | null;
-  model_slug?: string | null;
-  provider_slug?: string | null;
-  created_at?: string;
-};
-
-type AttachmentItem = {
-  id: number;
-  chat_id?: number;
-  file_name?: string;
-  original_name?: string | null;
-  mime_type?: string | null;
-  size_bytes?: number | null;
-  parse_status?: string | null;
-  created_at?: string | null;
-};
-
-type ModelItem = {
-  id?: number;
-  slug: string;
-  name?: string | null;
-  title?: string | null;
-  display_name?: string | null;
-  provider_slug?: string | null;
-  supports_vision?: boolean;
-  is_default?: boolean;
-  is_active?: boolean;
-};
-
-type AuthUser = {
-  id: number;
-  email: string;
-  is_active: boolean;
-  total_spent_usd?: number;
-  spending_limit_usd?: number;
-  billing_enabled?: boolean;
-  created_at?: string;
-  updated_at?: string;
-};
-
-type AuthResponse = {
-  access_token: string;
-  token_type: string;
-  user: AuthUser;
-};
-
-type ViewMode = "chat" | "image";
 type AuthMode = "login" | "register";
+type WorkMode = "chat" | "image";
 
-function isImageFile(file: File) {
-  return file.type.startsWith("image/");
+const FALLBACK_MODEL_SLUG = "claude-sonnet-4-6";
+
+function getErrorMessage(error: unknown, fallback: string): string {
+  const err = error as {
+    response?: {
+      data?: {
+        detail?: unknown;
+        message?: unknown;
+      };
+      status?: number;
+    };
+    message?: string;
+  };
+
+  const detail = err?.response?.data?.detail;
+  const message = err?.response?.data?.message;
+
+  if (typeof detail === "string" && detail.trim()) {
+    return detail;
+  }
+
+  if (Array.isArray(detail)) {
+    const joined = detail
+      .map((item) => {
+        if (typeof item === "string") return item;
+        if (item && typeof item === "object" && "msg" in item) {
+          const msg = (item as { msg?: unknown }).msg;
+          return typeof msg === "string" ? msg : "";
+        }
+        return "";
+      })
+      .filter(Boolean)
+      .join(", ");
+
+    if (joined) {
+      return joined;
+    }
+  }
+
+  if (typeof message === "string" && message.trim()) {
+    return message;
+  }
+
+  if (typeof err?.message === "string" && err.message.trim()) {
+    return err.message;
+  }
+
+  return fallback;
 }
 
-function isVisionModel(modelSlug?: string | null) {
-  if (!modelSlug) return false;
-  return modelSlug.includes("gpt-4.1");
-}
-
-function getModelLabel(model: ModelItem) {
-  return model.display_name || model.title || model.name || model.slug;
+function getModelLabel(model: ModelItem): string {
+  const provider = model.provider_slug || model.provider || "";
+  return provider ? `${model.name} (${provider})` : model.name;
 }
 
 function getBackendOrigin() {
   return (
-    process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api"
+    process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000/api"
   ).replace(/\/api\/?$/, "");
 }
 
-function normalizeImageUrl(rawUrl?: string | null) {
+function normalizeImageUrl(rawUrl?: string | null): string | null {
   if (!rawUrl) return null;
   if (rawUrl.startsWith("http://") || rawUrl.startsWith("https://")) {
     return rawUrl;
@@ -93,88 +97,277 @@ function normalizeImageUrl(rawUrl?: string | null) {
   return `${getBackendOrigin()}${rawUrl}`;
 }
 
+function extractAssistantMessage(
+  raw: MessageItem | Record<string, unknown> | string,
+  chatId: number,
+  modelSlug: string
+): MessageItem | null {
+  if (!raw) {
+    return null;
+  }
+
+  if (typeof raw === "string") {
+    return {
+      id: Date.now(),
+      chat_id: chatId,
+      role: "assistant",
+      content: raw,
+      model_slug: modelSlug,
+      created_at: new Date().toISOString(),
+    };
+  }
+
+  const data = raw as Record<string, unknown>;
+
+  const candidates = [
+    data.assistant_message,
+    data.message,
+    data.item,
+    data.data,
+    data.response,
+  ];
+
+  for (const candidate of candidates) {
+    if (
+      candidate &&
+      typeof candidate === "object" &&
+      "chat_id" in candidate &&
+      "role" in candidate &&
+      "content" in candidate
+    ) {
+      const msg = candidate as MessageItem;
+      return {
+        ...msg,
+        model_slug: msg.model_slug || modelSlug,
+        image_url: normalizeImageUrl(msg.image_url),
+      };
+    }
+  }
+
+  if ("chat_id" in data && "role" in data && "content" in data) {
+    const msg = data as unknown as MessageItem;
+    return {
+      ...msg,
+      model_slug: msg.model_slug || modelSlug,
+      image_url: normalizeImageUrl(msg.image_url),
+    };
+  }
+
+  if (typeof data.content === "string" || typeof data.image_url === "string") {
+    return {
+      id: Date.now(),
+      chat_id: chatId,
+      role: "assistant",
+      content:
+        typeof data.content === "string"
+          ? data.content
+          : "Изображение сгенерировано.",
+      model_slug: modelSlug,
+      image_url: normalizeImageUrl(
+        typeof data.image_url === "string" ? data.image_url : null
+      ),
+      created_at: new Date().toISOString(),
+    };
+  }
+
+  if (typeof data.text === "string") {
+    return {
+      id: Date.now(),
+      chat_id: chatId,
+      role: "assistant",
+      content: data.text,
+      model_slug: modelSlug,
+      created_at: new Date().toISOString(),
+    };
+  }
+
+  if (typeof data.assistant_reply === "string") {
+    return {
+      id: Date.now(),
+      chat_id: chatId,
+      role: "assistant",
+      content: data.assistant_reply,
+      model_slug: modelSlug,
+      created_at: new Date().toISOString(),
+    };
+  }
+
+  return null;
+}
+
+function formatDate(value?: string): string {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString("ru-RU");
+}
+
+function buildChatPlainText(
+  chat: ChatItem | null,
+  messages: MessageItem[],
+  attachments: AttachmentItem[]
+): string {
+  const header = [
+    `Чат: ${chat?.title || "Без названия"}`,
+    `Модель: ${chat?.model_slug || "-"}`,
+    `Создан: ${formatDate(chat?.created_at) || "-"}`,
+    `Обновлён: ${formatDate(chat?.updated_at) || "-"}`,
+    "",
+    "Вложения:",
+    ...(attachments.length > 0
+      ? attachments.map(
+          (item, index) =>
+            `${index + 1}. ${item.original_name} | ${item.mime_type || "unknown"} | ${item.size_bytes ?? 0} bytes | статус: ${item.parse_status || "unknown"}`
+        )
+      : ["Нет вложений"]),
+    "",
+    "Сообщения:",
+    ...messages.flatMap((message, index) => [
+      `${index + 1}. ${message.role.toUpperCase()} | ${formatDate(message.created_at) || "-"}`,
+      message.content,
+      message.image_url ? `IMAGE: ${normalizeImageUrl(message.image_url)}` : "",
+      "",
+    ]),
+  ];
+
+  return header.join("\n");
+}
+
+function downloadTextFile(filename: string, content: string, mimeType: string): void {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
+}
+
+async function copyTextWithFallback(text: string): Promise<void> {
+  if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+
+  if (typeof document === "undefined") {
+    throw new Error("Clipboard API is unavailable in this environment.");
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "true");
+  textarea.style.position = "fixed";
+  textarea.style.top = "-9999px";
+  textarea.style.left = "-9999px";
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+  textarea.setSelectionRange(0, textarea.value.length);
+
+  const success = document.execCommand("copy");
+  document.body.removeChild(textarea);
+
+  if (!success) {
+    throw new Error("Не удалось скопировать текст через fallback.");
+  }
+}
+
 export default function Chat() {
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
-  const [authChecking, setAuthChecking] = useState(true);
   const [authMode, setAuthMode] = useState<AuthMode>("login");
-  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
-  const [authEmail, setAuthEmail] = useState("");
-  const [authPassword, setAuthPassword] = useState("");
+  const [authChecking, setAuthChecking] = useState(true);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [authUser, setAuthUser] = useState<UserMe | null>(null);
+
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
   const [authLoading, setAuthLoading] = useState(false);
-  const [authError, setAuthError] = useState<string | null>(null);
+
+  const [models, setModels] = useState<ModelItem[]>([]);
+  const [selectedModelSlug, setSelectedModelSlug] = useState(FALLBACK_MODEL_SLUG);
 
   const [chats, setChats] = useState<ChatItem[]>([]);
-  const [models, setModels] = useState<ModelItem[]>([]);
-  const [selectedDefaultModelSlug, setSelectedDefaultModelSlug] =
-    useState<string>("claude-sonnet-4-6");
-
   const [selectedChatId, setSelectedChatId] = useState<number | null>(null);
   const [messages, setMessages] = useState<MessageItem[]>([]);
   const [attachments, setAttachments] = useState<AttachmentItem[]>([]);
-  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+
   const [message, setMessage] = useState("");
-
-  const [viewMode, setViewMode] = useState<ViewMode>("chat");
   const [imagePrompt, setImagePrompt] = useState("");
-  const [generatingImage, setGeneratingImage] = useState(false);
+  const [workMode, setWorkMode] = useState<WorkMode>("chat");
 
-  const [loadingChats, setLoadingChats] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [errorText, setErrorText] = useState<string | null>(null);
+  const [successText, setSuccessText] = useState<string | null>(null);
+
   const [loadingModels, setLoadingModels] = useState(false);
+  const [loadingChats, setLoadingChats] = useState(false);
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [loadingAttachments, setLoadingAttachments] = useState(false);
-  const [sending, setSending] = useState(false);
-  const [uploadingFiles, setUploadingFiles] = useState(false);
   const [creatingChat, setCreatingChat] = useState(false);
-  const [updatingModel, setUpdatingModel] = useState(false);
-  const [deletingChatId, setDeletingChatId] = useState<number | null>(null);
+  const [sending, setSending] = useState(false);
+  const [generatingImage, setGeneratingImage] = useState(false);
+  const [updatingChatModel, setUpdatingChatModel] = useState(false);
+  const [deletingChat, setDeletingChat] = useState(false);
   const [deletingAttachmentId, setDeletingAttachmentId] = useState<number | null>(null);
-
-  const [errorText, setErrorText] = useState<string | null>(null);
-  const [warningText, setWarningText] = useState<string | null>(null);
-  const [copiedText, setCopiedText] = useState<string | null>(null);
+  const [copyingChat, setCopyingChat] = useState(false);
+  const [sharingChat, setSharingChat] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const selectedChat = useMemo(
-    () => chats.find((chat) => chat.id === selectedChatId) || null,
+    () => chats.find((item) => item.id === selectedChatId) || null,
     [chats, selectedChatId]
   );
 
-  function resetChatState() {
-    setChats([]);
-    setSelectedChatId(null);
-    setMessages([]);
-    setAttachments([]);
-    setSelectedFiles([]);
-    setMessage("");
-    setViewMode("chat");
-    setErrorText(null);
-    setWarningText(null);
-    setCopiedText(null);
-  }
+  useEffect(() => {
+    void initializeAuth();
+  }, []);
 
-  async function loadCurrentUser() {
-    const response = await api.get("/auth/me");
-    return response.data as AuthUser;
-  }
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    void loadInitialData();
+  }, [isAuthenticated]);
+
+  useEffect(() => {
+    if (!selectedChatId || !isAuthenticated) {
+      setMessages([]);
+      setAttachments([]);
+      return;
+    }
+
+    void loadChatData(selectedChatId);
+  }, [selectedChatId, isAuthenticated]);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  useEffect(() => {
+    if (!selectedChat) return;
+    if (selectedChat.model_slug) {
+      setSelectedModelSlug(selectedChat.model_slug);
+    }
+  }, [selectedChat]);
 
   async function initializeAuth() {
     const token = initAuthToken();
 
     if (!token) {
+      setAuthChecking(false);
       setIsAuthenticated(false);
       setAuthUser(null);
-      setAuthChecking(false);
       return;
     }
 
     try {
-      const me = await loadCurrentUser();
+      const me = await getMe();
       setAuthUser(me);
       setIsAuthenticated(true);
-    } catch (err) {
-      console.error("Ошибка проверки токена:", err);
+    } catch (error) {
+      console.error("Ошибка проверки токена:", error);
       setAuthToken(null);
       setAuthUser(null);
       setIsAuthenticated(false);
@@ -183,91 +376,32 @@ export default function Chat() {
     }
   }
 
-  async function handleAuthSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-
-    const email = authEmail.trim().toLowerCase();
-    const password = authPassword.trim();
-
-    if (!email || !password) {
-      setAuthError("Введите email и пароль.");
-      return;
-    }
-
-    try {
-      setAuthLoading(true);
-      setAuthError(null);
-
-      const endpoint = authMode === "login" ? "/auth/login" : "/auth/register";
-
-      const response = await api.post<AuthResponse>(endpoint, {
-        email,
-        password,
-      });
-
-      setAuthToken(response.data.access_token);
-      setAuthUser(response.data.user);
-      setIsAuthenticated(true);
-      setAuthPassword("");
-      setAuthError(null);
-      resetChatState();
-
-      await Promise.all([loadModels(), loadChats()]);
-    } catch (err: any) {
-      console.error("Ошибка авторизации:", err);
-
-      const backendMessage =
-        err?.response?.data?.detail ||
-        err?.response?.data?.message ||
-        null;
-
-      setAuthError(
-        backendMessage ||
-          (authMode === "login"
-            ? "Не удалось выполнить вход."
-            : "Не удалось зарегистрироваться.")
-      );
-    } finally {
-      setAuthLoading(false);
-    }
-  }
-
-  async function handleLogout() {
-    setAuthToken(null);
-    setIsAuthenticated(false);
-    setAuthUser(null);
-    setAuthEmail("");
-    setAuthPassword("");
-    setAuthError(null);
-    resetChatState();
+  async function loadInitialData() {
+    await Promise.all([loadModels(), loadChats()]);
   }
 
   async function loadModels() {
     try {
       setLoadingModels(true);
+      const items = await getModels();
+      setModels(items);
 
-      const response = await api.get("/models");
-      const items = response.data?.items ?? response.data ?? [];
-      const normalized = Array.isArray(items) ? items : [];
+      const explicitFallback = items.find((item) => item.slug === FALLBACK_MODEL_SLUG);
+      const defaultModel = items.find((item) => item.is_default);
+      const firstActive = items.find((item) => item.is_active !== false);
+      const firstItem = items[0];
 
-      setModels(normalized);
-
-      const sonnet = normalized.find(
-        (item) => item.slug === "claude-sonnet-4-6"
-      );
-      const defaultModel = normalized.find((item) => item.is_default);
-      const firstModel = normalized[0];
-
-      const nextDefault =
-        sonnet?.slug ||
+      const nextSlug =
+        explicitFallback?.slug ||
         defaultModel?.slug ||
-        firstModel?.slug ||
-        "claude-sonnet-4-6";
+        firstActive?.slug ||
+        firstItem?.slug ||
+        FALLBACK_MODEL_SLUG;
 
-      setSelectedDefaultModelSlug(nextDefault);
-    } catch (err) {
-      console.error("Ошибка загрузки моделей:", err);
-      setErrorText("Не удалось загрузить список моделей.");
+      setSelectedModelSlug(nextSlug);
+    } catch (error) {
+      console.error("Ошибка загрузки моделей:", error);
+      setErrorText(getErrorMessage(error, "Не удалось загрузить модели."));
     } finally {
       setLoadingModels(false);
     }
@@ -276,291 +410,590 @@ export default function Chat() {
   async function loadChats() {
     try {
       setLoadingChats(true);
+      setErrorText(null);
 
-      const response = await api.get("/chats");
-      const items = response.data?.items ?? response.data ?? [];
-      const normalized = Array.isArray(items) ? items : [];
+      const items = await getChats();
+      setChats(items);
 
-      setChats(normalized);
+      setSelectedChatId((prev) => {
+        if (prev && items.some((chat) => chat.id === prev)) {
+          return prev;
+        }
+        return items.length > 0 ? items[0].id : null;
+      });
+    } catch (error) {
+      console.error("Ошибка загрузки чатов:", error);
 
-      if (normalized.length > 0 && selectedChatId == null) {
-        setSelectedChatId(normalized[0].id);
-      }
-    } catch (err: any) {
-      console.error("Ошибка загрузки чатов:", err);
-
+      const err = error as { response?: { status?: number } };
       if (err?.response?.status === 401) {
-        setAuthToken(null);
-        setIsAuthenticated(false);
-        setAuthUser(null);
-        resetChatState();
+        handleLogout();
         return;
       }
 
-      setErrorText("Не удалось загрузить список чатов.");
+      setErrorText(getErrorMessage(error, "Не удалось загрузить список чатов."));
     } finally {
       setLoadingChats(false);
     }
   }
 
+  async function loadChatData(chatId: number) {
+    await Promise.all([loadMessages(chatId), loadAttachmentsForChat(chatId)]);
+  }
+
   async function loadMessages(chatId: number) {
     try {
       setLoadingMessages(true);
+      setErrorText(null);
 
-      const response = await api.get(`/history/${chatId}`);
-      const items = response.data?.items ?? response.data ?? [];
-      const normalized = Array.isArray(items) ? items : [];
-
-      setMessages(normalized);
-    } catch (err) {
-      console.error("Ошибка загрузки сообщений:", err);
-      setErrorText("Не удалось загрузить историю чата.");
+      const items = await getHistory(chatId);
+      setMessages(
+        items.map((item) => ({
+          ...item,
+          image_url: normalizeImageUrl(item.image_url),
+        }))
+      );
+    } catch (error) {
+      console.error("Ошибка загрузки сообщений:", error);
+      setErrorText(getErrorMessage(error, "Не удалось загрузить историю чата."));
     } finally {
       setLoadingMessages(false);
     }
   }
 
-  async function loadAttachments(chatId: number) {
+  async function loadAttachmentsForChat(chatId: number) {
     try {
       setLoadingAttachments(true);
-
-      const response = await api.get(`/attachments/chat/${chatId}`);
-      const items = response.data?.items ?? response.data ?? [];
-      const normalized = Array.isArray(items) ? items : [];
-
-      setAttachments(normalized);
-    } catch (err) {
-      console.error("Ошибка загрузки вложений:", err);
+      const items = await getAttachments(chatId);
+      setAttachments(items);
+    } catch (error) {
+      console.error("Ошибка загрузки вложений:", error);
       setAttachments([]);
     } finally {
       setLoadingAttachments(false);
     }
   }
 
-  async function handleCreateChat() {
+  function clearSessionState() {
+    setChats([]);
+    setSelectedChatId(null);
+    setMessages([]);
+    setAttachments([]);
+    setSelectedFile(null);
+    setMessage("");
+    setImagePrompt("");
+    setErrorText(null);
+    setSuccessText(null);
+    setWorkMode("chat");
+  }
+
+  function handleLogout() {
+    setAuthToken(null);
+    setAuthUser(null);
+    setIsAuthenticated(false);
+    setAuthChecking(false);
+    setEmail("");
+    setPassword("");
+    setAuthError(null);
+    clearSessionState();
+  }
+
+  async function handleAuthSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+
+    const normalizedEmail = email.trim().toLowerCase();
+    const normalizedPassword = password.trim();
+
+    if (!normalizedEmail || !normalizedPassword) {
+      setAuthError("Введите email и пароль.");
+      return;
+    }
+
+    try {
+      setAuthLoading(true);
+      setAuthError(null);
+      setErrorText(null);
+      setSuccessText(null);
+
+      const response =
+        authMode === "login"
+          ? await login({ email: normalizedEmail, password: normalizedPassword })
+          : await register({ email: normalizedEmail, password: normalizedPassword });
+
+      setAuthToken(response.access_token);
+
+      const me = response.user ?? (await getMe());
+
+      setAuthUser(me);
+      setIsAuthenticated(true);
+      setPassword("");
+      clearSessionState();
+    } catch (error) {
+      console.error("Ошибка авторизации:", error);
+      setAuthError(
+        getErrorMessage(
+          error,
+          authMode === "login"
+            ? "Не удалось выполнить вход."
+            : "Не удалось зарегистрироваться."
+        )
+      );
+    } finally {
+      setAuthLoading(false);
+    }
+  }
+
+  async function createNewChat(): Promise<ChatItem | null> {
+    const modelSlug =
+      selectedModelSlug ||
+      models.find((item) => item.slug === FALLBACK_MODEL_SLUG)?.slug ||
+      models[0]?.slug ||
+      FALLBACK_MODEL_SLUG;
+
     try {
       setCreatingChat(true);
       setErrorText(null);
+      setSuccessText(null);
 
-      const response = await api.post("/chats", {
-        title: "Новый чат",
-        model_slug: selectedDefaultModelSlug,
-        system_prompt: "",
+      const created = await createChat({
+        title: workMode === "image" ? "Новый image чат" : "Новый чат",
+        model_slug: modelSlug,
+        system_prompt: "Отвечай кратко и по делу.",
       });
 
-      const createdChat = response.data as ChatItem;
+      setChats((prev) => [created, ...prev]);
+      setSelectedChatId(created.id);
+      setSelectedModelSlug(created.model_slug || modelSlug);
+      setMessages([]);
+      setAttachments([]);
+      setSelectedFile(null);
+      setMessage("");
+      setImagePrompt("");
 
-      await loadChats();
-      setSelectedChatId(createdChat.id);
-      await loadMessages(createdChat.id);
-      await loadAttachments(createdChat.id);
-    } catch (err) {
-      console.error("Ошибка создания чата:", err);
-      setErrorText("Не удалось создать новый чат.");
+      return created;
+    } catch (error) {
+      console.error("Ошибка создания чата:", error);
+      setErrorText(getErrorMessage(error, "Не удалось создать чат."));
+      return null;
     } finally {
       setCreatingChat(false);
     }
   }
 
-  async function handleSelectChat(chatId: number) {
-    setSelectedChatId(chatId);
-    await Promise.all([loadMessages(chatId), loadAttachments(chatId)]);
+  async function ensureChat(): Promise<ChatItem | null> {
+    if (selectedChat) {
+      return selectedChat;
+    }
+
+    return createNewChat();
   }
 
-  async function handleSendMessage() {
-    if (!selectedChatId || !message.trim()) {
+  async function handleCreateChat() {
+    const chat = await createNewChat();
+    if (chat) {
+      setSuccessText(`Чат #${chat.id} создан.`);
+    }
+  }
+
+  async function handleDeleteSelectedChat() {
+    if (!selectedChat) {
+      setErrorText("Нет выбранного чата для удаления.");
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Удалить чат "${selectedChat.title || `#${selectedChat.id}`}"?`
+    );
+
+    if (!confirmed) {
       return;
     }
 
     try {
-      setSending(true);
+      setDeletingChat(true);
       setErrorText(null);
+      setSuccessText(null);
 
-      await api.post("/chat", {
-        chat_id: selectedChatId,
-        message: message.trim(),
-        model_slug: selectedChat?.model_slug || selectedDefaultModelSlug,
-      });
+      await deleteChat(selectedChat.id);
 
-      setMessage("");
-      await loadMessages(selectedChatId);
-      await loadChats();
-    } catch (err) {
-      console.error("Ошибка отправки сообщения:", err);
-      setErrorText("Не удалось отправить сообщение.");
-    } finally {
-      setSending(false);
-    }
-  }
-
-  async function handleGenerateImage() {
-    if (!selectedChatId || !imagePrompt.trim()) {
-      return;
-    }
-
-    try {
-      setGeneratingImage(true);
-      setErrorText(null);
-
-      await api.post(
-        `/images/generate?prompt=${encodeURIComponent(
-          imagePrompt.trim()
-        )}&chat_id=${selectedChatId}`
-      );
-
-      setImagePrompt("");
-      await loadMessages(selectedChatId);
-    } catch (err) {
-      console.error("Ошибка генерации изображения:", err);
-      setErrorText("Не удалось сгенерировать изображение.");
-    } finally {
-      setGeneratingImage(false);
-    }
-  }
-
-  async function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
-    const files = Array.from(event.target.files || []);
-    setSelectedFiles(files);
-  }
-
-  async function handleUploadFiles() {
-    if (!selectedChatId || selectedFiles.length === 0) {
-      return;
-    }
-
-    try {
-      setUploadingFiles(true);
-      setErrorText(null);
-
-      for (const file of selectedFiles) {
-        const formData = new FormData();
-        formData.append("chat_id", String(selectedChatId));
-        formData.append("file", file);
-
-        await api.post("/attachments/upload", formData, {
-          headers: {
-            "Content-Type": "multipart/form-data",
-          },
-        });
-      }
-
-      setSelectedFiles([]);
-      if (fileInputRef.current) {
-        fileInputRef.current.value = "";
-      }
-
-      await loadAttachments(selectedChatId);
-    } catch (err: any) {
-      console.error("Ошибка загрузки файлов:", err);
-
-      const backendMessage =
-        err?.response?.data?.detail ||
-        err?.response?.data?.message ||
-        "Не удалось загрузить файл.";
-
-      setErrorText(String(backendMessage));
-    } finally {
-      setUploadingFiles(false);
-    }
-  }
-
-  async function handleDeleteChat(chatId: number) {
-    try {
-      setDeletingChatId(chatId);
-      setErrorText(null);
-
-      await api.delete(`/chats/${chatId}`);
-
-      const nextChats = chats.filter((chat) => chat.id !== chatId);
+      const nextChats = chats.filter((chat) => chat.id !== selectedChat.id);
       setChats(nextChats);
 
-      if (selectedChatId === chatId) {
-        const nextSelected = nextChats[0]?.id ?? null;
-        setSelectedChatId(nextSelected);
+      if (nextChats.length > 0) {
+        setSelectedChatId(nextChats[0].id);
+      } else {
+        setSelectedChatId(null);
         setMessages([]);
         setAttachments([]);
-
-        if (nextSelected) {
-          await Promise.all([loadMessages(nextSelected), loadAttachments(nextSelected)]);
-        }
       }
-    } catch (err) {
-      console.error("Ошибка удаления чата:", err);
-      setErrorText("Не удалось удалить чат.");
+
+      setSelectedFile(null);
+      setMessage("");
+      setImagePrompt("");
+      setSuccessText("Чат удалён.");
+    } catch (error) {
+      console.error("Ошибка удаления чата:", error);
+      setErrorText(
+        getErrorMessage(
+          error,
+          "Не удалось удалить чат. Проверь, существует ли DELETE /api/chats/{id} в backend."
+        )
+      );
     } finally {
-      setDeletingChatId(null);
+      setDeletingChat(false);
     }
   }
 
-  async function handleDeleteAttachment(attachmentId: number) {
-    if (!selectedChatId) return;
+  async function handleChangeChatModel(nextModelSlug: string) {
+    if (!selectedChat) {
+      setSelectedModelSlug(nextModelSlug);
+      return;
+    }
 
     try {
-      setDeletingAttachmentId(attachmentId);
-      await api.delete(`/attachments/${attachmentId}`);
-      await loadAttachments(selectedChatId);
-    } catch (err) {
-      console.error("Ошибка удаления файла:", err);
-      setErrorText("Не удалось удалить файл.");
+      setUpdatingChatModel(true);
+      setErrorText(null);
+      setSuccessText(null);
+
+      const updated = await updateChat(selectedChat.id, {
+        model_slug: nextModelSlug,
+      });
+
+      setChats((prev) =>
+        prev.map((chat) => (chat.id === updated.id ? updated : chat))
+      );
+      setSelectedModelSlug(updated.model_slug || nextModelSlug);
+      setSuccessText(`Модель чата изменена на ${updated.model_slug}.`);
+    } catch (error) {
+      console.error("Ошибка смены модели чата:", error);
+      setErrorText(
+        getErrorMessage(
+          error,
+          "Не удалось изменить модель чата. Проверь, существует ли PATCH /api/chats/{id} в backend."
+        )
+      );
+    } finally {
+      setUpdatingChatModel(false);
+    }
+  }
+
+  async function handleDeleteAttachment(attachment: AttachmentItem) {
+    const confirmed = window.confirm(
+      `Удалить файл "${attachment.original_name || `#${attachment.id}`}"?`
+    );
+
+    if (!confirmed) {
+      return;
+    }
+
+    try {
+      setDeletingAttachmentId(attachment.id);
+      setErrorText(null);
+      setSuccessText(null);
+
+      await deleteAttachment(attachment.id);
+
+      setAttachments((prev) => prev.filter((item) => item.id !== attachment.id));
+      setSuccessText(`Файл "${attachment.original_name}" удалён.`);
+    } catch (error) {
+      console.error("Ошибка удаления файла:", error);
+      setErrorText(
+        getErrorMessage(
+          error,
+          "Не удалось удалить файл. Проверь, существует ли DELETE /api/attachments/{id} в backend."
+        )
+      );
     } finally {
       setDeletingAttachmentId(null);
     }
   }
 
-  async function handleChangeChatModel(chatId: number, nextModelSlug: string) {
-    try {
-      setUpdatingModel(true);
-      setErrorText(null);
+  async function handleCopyChatContent() {
+    if (!selectedChat) {
+      setErrorText("Нет выбранного чата для копирования.");
+      return;
+    }
 
-      await api.patch(`/chats/${chatId}`, {
-        model_slug: nextModelSlug,
+    try {
+      setCopyingChat(true);
+      setErrorText(null);
+      setSuccessText(null);
+
+      const content = buildChatPlainText(selectedChat, messages, attachments);
+      await copyTextWithFallback(content);
+
+      setSuccessText("Содержимое чата скопировано в буфер обмена.");
+    } catch (error) {
+      console.error("Ошибка копирования чата:", error);
+      setErrorText(
+        getErrorMessage(error, "Не удалось скопировать содержимое чата.")
+      );
+    } finally {
+      setCopyingChat(false);
+    }
+  }
+
+  function handleExportChatTxt() {
+    if (!selectedChat) {
+      setErrorText("Нет выбранного чата для экспорта.");
+      return;
+    }
+
+    const content = buildChatPlainText(selectedChat, messages, attachments);
+    const safeTitle = (selectedChat.title || `chat-${selectedChat.id}`)
+      .replace(/[^\p{L}\p{N}\-_ ]/gu, "_")
+      .trim()
+      .replace(/\s+/g, "_");
+
+    downloadTextFile(
+      `${safeTitle || `chat-${selectedChat.id}`}.txt`,
+      content,
+      "text/plain;charset=utf-8"
+    );
+    setSuccessText("TXT-экспорт чата сохранён.");
+  }
+
+  function handleExportChatJson() {
+    if (!selectedChat) {
+      setErrorText("Нет выбранного чата для экспорта.");
+      return;
+    }
+
+    const payload = {
+      chat: selectedChat,
+      attachments,
+      messages,
+      exported_at: new Date().toISOString(),
+    };
+
+    const safeTitle = (selectedChat.title || `chat-${selectedChat.id}`)
+      .replace(/[^\p{L}\p{N}\-_ ]/gu, "_")
+      .trim()
+      .replace(/\s+/g, "_");
+
+    downloadTextFile(
+      `${safeTitle || `chat-${selectedChat.id}`}.json`,
+      JSON.stringify(payload, null, 2),
+      "application/json;charset=utf-8"
+    );
+    setSuccessText("JSON-экспорт чата сохранён.");
+  }
+
+  async function handleShareChat() {
+    if (!selectedChat) {
+      setErrorText("Нет выбранного чата для отправки.");
+      return;
+    }
+
+    const content = buildChatPlainText(selectedChat, messages, attachments);
+    const title = selectedChat.title || `Чат #${selectedChat.id}`;
+
+    try {
+      setSharingChat(true);
+      setErrorText(null);
+      setSuccessText(null);
+
+      if (typeof navigator !== "undefined" && navigator.share) {
+        await navigator.share({
+          title,
+          text: content,
+        });
+        setSuccessText("Чат отправлен через системное меню шаринга.");
+        return;
+      }
+
+      try {
+        await copyTextWithFallback(content);
+        setSuccessText(
+          "Системный шаринг недоступен. Содержимое чата скопировано в буфер."
+        );
+        return;
+      } catch {
+        const safeTitle = title
+          .replace(/[^\p{L}\p{N}\-_ ]/gu, "_")
+          .trim()
+          .replace(/\s+/g, "_");
+
+        downloadTextFile(
+          `${safeTitle || `chat-${selectedChat.id}`}.txt`,
+          content,
+          "text/plain;charset=utf-8"
+        );
+        setSuccessText(
+          "Системный шаринг и буфер недоступны. Чат экспортирован в TXT."
+        );
+      }
+    } catch (error) {
+      console.error("Ошибка share/export чата:", error);
+      setErrorText(getErrorMessage(error, "Не удалось поделиться чатом."));
+    } finally {
+      setSharingChat(false);
+    }
+  }
+
+  function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0] ?? null;
+    setSelectedFile(file);
+  }
+
+  async function handleSendMessage(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+
+    const text = message.trim();
+    const hasFile = !!selectedFile;
+
+    if (!text && !hasFile) {
+      setErrorText("Введите сообщение или выберите файл.");
+      return;
+    }
+
+    const chat = await ensureChat();
+    if (!chat) {
+      return;
+    }
+
+    const modelSlug =
+      chat.model_slug ||
+      selectedModelSlug ||
+      models.find((item) => item.slug === FALLBACK_MODEL_SLUG)?.slug ||
+      models[0]?.slug ||
+      FALLBACK_MODEL_SLUG;
+
+    const outgoingText = text || "Проанализируй приложенный файл.";
+
+    const optimisticUserMessage: MessageItem = {
+      id: Date.now(),
+      chat_id: chat.id,
+      role: "user",
+      content: hasFile ? `${outgoingText}\n\n[Файл: ${selectedFile?.name}]` : outgoingText,
+      model_slug: modelSlug,
+      created_at: new Date().toISOString(),
+    };
+
+    try {
+      setSending(true);
+      setErrorText(null);
+      setSuccessText(null);
+
+      setMessages((prev) => [...prev, optimisticUserMessage]);
+      setMessage("");
+
+      const response =
+        hasFile && selectedFile
+          ? await sendMessageWithAttachment({
+              chat_id: chat.id,
+              message: outgoingText,
+              model_slug: modelSlug,
+              file: selectedFile,
+            })
+          : await sendMessage({
+              chat_id: chat.id,
+              message: outgoingText,
+              model_slug: modelSlug,
+            });
+
+      const assistantMessage = extractAssistantMessage(response, chat.id, modelSlug);
+
+      if (assistantMessage) {
+        setMessages((prev) => [...prev, assistantMessage]);
+      } else {
+        await loadMessages(chat.id);
+      }
+
+      await loadAttachmentsForChat(chat.id);
+      await loadChats();
+
+      setSelectedFile(null);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+    } catch (error) {
+      console.error("Ошибка отправки сообщения:", error);
+
+      setMessages((prev) =>
+        prev.filter((item) => item.id !== optimisticUserMessage.id)
+      );
+
+      setErrorText(getErrorMessage(error, "Не удалось отправить сообщение."));
+    } finally {
+      setSending(false);
+    }
+  }
+
+  async function handleGenerateImage(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+
+    const prompt = imagePrompt.trim();
+    if (!prompt) {
+      setErrorText("Введите промпт для генерации изображения.");
+      return;
+    }
+
+    if (selectedFile) {
+      setErrorText(
+        "Backend сейчас поддерживает только text → image через /api/images/generate. Сценарий text + image → image пока недоступен."
+      );
+      return;
+    }
+
+    const chat = await ensureChat();
+    if (!chat) {
+      return;
+    }
+
+    const optimisticUserMessage: MessageItem = {
+      id: Date.now(),
+      chat_id: chat.id,
+      role: "user",
+      content: `[IMAGE PROMPT]\n${prompt}`,
+      model_slug: chat.model_slug || selectedModelSlug,
+      created_at: new Date().toISOString(),
+    };
+
+    try {
+      setGeneratingImage(true);
+      setErrorText(null);
+      setSuccessText(null);
+
+      setMessages((prev) => [...prev, optimisticUserMessage]);
+
+      const response = await generateImage({
+        prompt,
+        chat_id: chat.id,
       });
 
+      const assistantMessage = extractAssistantMessage(
+        response as MessageItem | Record<string, unknown> | string,
+        chat.id,
+        chat.model_slug || selectedModelSlug
+      );
+
+      if (assistantMessage) {
+        const normalizedAssistant: MessageItem = {
+          ...assistantMessage,
+          content:
+            assistantMessage.content?.trim() || "Изображение сгенерировано.",
+          image_url: normalizeImageUrl(assistantMessage.image_url),
+        };
+
+        setMessages((prev) => [...prev, normalizedAssistant]);
+      } else {
+        await loadMessages(chat.id);
+      }
+
       await loadChats();
-    } catch (err) {
-      console.error("Ошибка смены модели:", err);
-      setErrorText("Не удалось изменить модель чата.");
+      setImagePrompt("");
+    } catch (error) {
+      console.error("Ошибка генерации изображения:", error);
+
+      setMessages((prev) =>
+        prev.filter((item) => item.id !== optimisticUserMessage.id)
+      );
+
+      setErrorText(getErrorMessage(error, "Не удалось сгенерировать изображение."));
     } finally {
-      setUpdatingModel(false);
+      setGeneratingImage(false);
     }
   }
-
-  async function copyText(text: string) {
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopiedText("Текст скопирован");
-      setTimeout(() => setCopiedText(null), 1500);
-    } catch (err) {
-      console.error("Ошибка копирования:", err);
-      setWarningText("Не удалось скопировать текст.");
-      setTimeout(() => setWarningText(null), 1500);
-    }
-  }
-
-  useEffect(() => {
-    void initializeAuth();
-  }, []);
-
-  useEffect(() => {
-    if (!isAuthenticated) return;
-    void loadModels();
-    void loadChats();
-  }, [isAuthenticated]);
-
-  useEffect(() => {
-    if (!isAuthenticated || !selectedChatId) return;
-    void loadMessages(selectedChatId);
-    void loadAttachments(selectedChatId);
-  }, [isAuthenticated, selectedChatId]);
-
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
-
-  const currentChat = useMemo(
-    () => chats.find((chat) => chat.id === selectedChatId) ?? null,
-    [chats, selectedChatId]
-  );
 
   if (authChecking) {
     return (
@@ -597,7 +1030,7 @@ export default function Chat() {
                 authMode === "register"
                   ? "bg-white text-slate-900"
                   : "text-slate-300"
-                }`}
+              }`}
               onClick={() => setAuthMode("register")}
             >
               Регистрация
@@ -607,15 +1040,15 @@ export default function Chat() {
           <form onSubmit={handleAuthSubmit} className="space-y-4">
             <input
               type="email"
-              value={authEmail}
-              onChange={(e) => setAuthEmail(e.target.value)}
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
               placeholder="Email"
               className="w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm outline-none"
             />
             <input
               type="password"
-              value={authPassword}
-              onChange={(e) => setAuthPassword(e.target.value)}
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
               placeholder="Пароль"
               className="w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm outline-none"
             />
@@ -667,7 +1100,7 @@ export default function Chat() {
 
           <button
             type="button"
-            onClick={handleCreateChat}
+            onClick={() => void handleCreateChat()}
             disabled={creatingChat}
             className="mb-4 w-full rounded-xl bg-white px-4 py-3 text-sm font-semibold text-slate-900 hover:bg-slate-200 disabled:cursor-not-allowed disabled:opacity-50"
           >
@@ -675,19 +1108,50 @@ export default function Chat() {
           </button>
 
           <label className="mb-2 block text-xs uppercase tracking-wide text-slate-400">
-            Модель по умолчанию
+            МОДЕЛЬ ПО УМОЛЧАНИЮ
           </label>
           <select
-            value={selectedDefaultModelSlug}
-            onChange={(e) => setSelectedDefaultModelSlug(e.target.value)}
+            value={selectedModelSlug}
+            onChange={(e) => setSelectedModelSlug(e.target.value)}
+            disabled={loadingModels || updatingChatModel}
             className="w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm outline-none"
           >
-            {models.map((model) => (
-              <option key={model.slug} value={model.slug}>
-                {getModelLabel(model)}
-              </option>
-            ))}
+            {models.length === 0 ? (
+              <option value={FALLBACK_MODEL_SLUG}>{FALLBACK_MODEL_SLUG}</option>
+            ) : (
+              models.map((model) => (
+                <option key={model.slug} value={model.slug}>
+                  {getModelLabel(model)}
+                </option>
+              ))
+            )}
           </select>
+
+          <div className="mt-4">
+            <label className="mb-2 block text-xs uppercase tracking-wide text-slate-400">
+              РЕЖИМ
+            </label>
+            <div className="flex rounded-xl bg-slate-800 p-1">
+              <button
+                type="button"
+                onClick={() => setWorkMode("chat")}
+                className={`flex-1 rounded-lg px-4 py-2 text-sm font-medium ${
+                  workMode === "chat" ? "bg-white text-slate-900" : "text-slate-300"
+                }`}
+              >
+                Чат
+              </button>
+              <button
+                type="button"
+                onClick={() => setWorkMode("image")}
+                className={`flex-1 rounded-lg px-4 py-2 text-sm font-medium ${
+                  workMode === "image" ? "bg-white text-slate-900" : "text-slate-300"
+                }`}
+              >
+                Изображение
+              </button>
+            </div>
+          </div>
         </div>
 
         <div className="flex-1 overflow-y-auto p-3">
@@ -704,53 +1168,26 @@ export default function Chat() {
               {chats.map((chat) => {
                 const isActive = chat.id === selectedChatId;
                 return (
-                  <div
+                  <button
                     key={chat.id}
-                    className={`rounded-xl border p-3 ${
+                    type="button"
+                    onClick={() => setSelectedChatId(chat.id)}
+                    className={`block w-full rounded-xl border p-3 text-left ${
                       isActive
                         ? "border-slate-500 bg-slate-800"
                         : "border-slate-800 bg-slate-950"
                     }`}
                   >
-                    <button
-                      type="button"
-                      onClick={() => handleSelectChat(chat.id)}
-                      className="mb-2 block w-full text-left"
-                    >
-                      <div className="truncate text-sm font-semibold">
-                        {chat.title}
-                      </div>
-                      <div className="mt-1 text-xs text-slate-400">
-                        {chat.model_slug}
-                      </div>
-                    </button>
-
-                    <div className="flex items-center gap-2">
-                      <select
-                        value={chat.model_slug}
-                        onChange={(e) =>
-                          void handleChangeChatModel(chat.id, e.target.value)
-                        }
-                        disabled={updatingModel}
-                        className="flex-1 rounded-lg border border-slate-700 bg-slate-900 px-2 py-2 text-xs outline-none"
-                      >
-                        {models.map((model) => (
-                          <option key={model.slug} value={model.slug}>
-                            {getModelLabel(model)}
-                          </option>
-                        ))}
-                      </select>
-
-                      <button
-                        type="button"
-                        onClick={() => void handleDeleteChat(chat.id)}
-                        disabled={deletingChatId === chat.id}
-                        className="rounded-lg border border-red-900 px-2 py-2 text-xs text-red-300 hover:bg-red-950 disabled:cursor-not-allowed disabled:opacity-50"
-                      >
-                        {deletingChatId === chat.id ? "..." : "Удалить"}
-                      </button>
+                    <div className="truncate text-sm font-semibold">
+                      {chat.title || `Чат #${chat.id}`}
                     </div>
-                  </div>
+                    <div className="mt-1 text-xs text-slate-400">
+                      {chat.model_slug}
+                    </div>
+                    <div className="mt-1 text-[11px] text-slate-500">
+                      {formatDate(chat.updated_at || chat.created_at)}
+                    </div>
+                  </button>
                 );
               })}
             </div>
@@ -760,237 +1197,272 @@ export default function Chat() {
 
       <main className="flex flex-1 flex-col">
         <div className="border-b border-slate-800 bg-slate-900 px-6 py-4">
-          <div className="mb-3 flex items-center justify-between gap-4">
+          <div className="flex flex-col gap-4 2xl:flex-row 2xl:items-end 2xl:justify-between">
             <div>
               <div className="text-lg font-semibold">
-                {currentChat ? currentChat.title : "Выберите чат"}
+                {selectedChat ? selectedChat.title || `Чат #${selectedChat.id}` : "Новый чат"}
               </div>
-              <div className="text-sm text-slate-400">
-                {currentChat
-                  ? `Модель: ${currentChat.model_slug}`
-                  : "Создайте новый чат или выберите существующий"}
+              <div className="mt-1 text-sm text-slate-400">
+                Активная модель: {selectedChat?.model_slug || selectedModelSlug}
               </div>
             </div>
 
-            <div className="flex rounded-xl border border-slate-800 bg-slate-950 p-1">
+            <div className="flex flex-col gap-3 xl:flex-row xl:flex-wrap xl:items-end xl:justify-end">
+              <div className="min-w-[260px]">
+                <label className="mb-2 block text-xs uppercase tracking-wide text-slate-400">
+                  МОДЕЛЬ ВНУТРИ ЧАТА
+                </label>
+                <select
+                  value={selectedChat?.model_slug || selectedModelSlug}
+                  onChange={(e) => void handleChangeChatModel(e.target.value)}
+                  disabled={!selectedChat || updatingChatModel || loadingModels}
+                  className="w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm outline-none"
+                >
+                  {models.length === 0 ? (
+                    <option value={FALLBACK_MODEL_SLUG}>{FALLBACK_MODEL_SLUG}</option>
+                  ) : (
+                    models.map((model) => (
+                      <option key={model.slug} value={model.slug}>
+                        {getModelLabel(model)}
+                      </option>
+                    ))
+                  )}
+                </select>
+              </div>
+
               <button
                 type="button"
-                onClick={() => setViewMode("chat")}
-                className={`rounded-lg px-3 py-2 text-sm ${
-                  viewMode === "chat"
-                    ? "bg-white text-slate-900"
-                    : "text-slate-300"
-                }`}
+                onClick={() => void handleCopyChatContent()}
+                disabled={!selectedChat || copyingChat}
+                className="rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm font-semibold text-slate-200 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
               >
-                Чат
+                {copyingChat ? "Копирование..." : "Копировать чат"}
               </button>
+
               <button
                 type="button"
-                onClick={() => setViewMode("image")}
-                className={`rounded-lg px-3 py-2 text-sm ${
-                  viewMode === "image"
-                    ? "bg-white text-slate-900"
-                    : "text-slate-300"
-                }`}
+                onClick={handleExportChatTxt}
+                disabled={!selectedChat}
+                className="rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm font-semibold text-slate-200 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
               >
-                Изображение
+                Экспорт TXT
+              </button>
+
+              <button
+                type="button"
+                onClick={handleExportChatJson}
+                disabled={!selectedChat}
+                className="rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm font-semibold text-slate-200 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                Экспорт JSON
+              </button>
+
+              <button
+                type="button"
+                onClick={() => void handleShareChat()}
+                disabled={!selectedChat || sharingChat}
+                className="rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm font-semibold text-slate-200 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {sharingChat ? "Поделиться..." : "Поделиться"}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => void handleDeleteSelectedChat()}
+                disabled={!selectedChat || deletingChat}
+                className="rounded-xl border border-red-900 bg-red-950 px-4 py-3 text-sm font-semibold text-red-200 hover:bg-red-900/50 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {deletingChat ? "Удаление..." : "Удалить чат"}
               </button>
             </div>
           </div>
-
-          {errorText && (
-            <div className="rounded-xl border border-red-900 bg-red-950 px-4 py-3 text-sm text-red-200">
-              {errorText}
-            </div>
-          )}
-
-          {warningText && (
-            <div className="mt-2 rounded-xl border border-amber-900 bg-amber-950 px-4 py-3 text-sm text-amber-200">
-              {warningText}
-            </div>
-          )}
-
-          {copiedText && (
-            <div className="mt-2 rounded-xl border border-emerald-900 bg-emerald-950 px-4 py-3 text-sm text-emerald-200">
-              {copiedText}
-            </div>
-          )}
         </div>
 
-        <div className="flex flex-1 overflow-hidden">
-          <section className="flex flex-1 flex-col">
-            <div className="flex-1 overflow-y-auto px-6 py-4">
-              {loadingMessages ? (
-                <div className="text-sm text-slate-400">Загрузка сообщений...</div>
-              ) : messages.length === 0 ? (
-                <div className="text-sm text-slate-400">
-                  Сообщений пока нет
-                </div>
-              ) : (
-                <div className="space-y-4">
-                  {messages.map((item) => (
-                    <div
-                      key={item.id}
-                      className={`max-w-3xl rounded-2xl border p-4 ${
-                        item.role === "user"
-                          ? "ml-auto border-slate-700 bg-slate-800"
-                          : "border-slate-800 bg-slate-900"
-                      }`}
-                    >
-                      <div className="mb-2 text-xs uppercase tracking-wide text-slate-400">
-                        {item.role}
-                      </div>
+        <div className="flex-1 overflow-y-auto px-6 py-4">
+          {errorText ? (
+            <div className="mb-4 rounded-xl border border-red-900 bg-red-950 px-4 py-3 text-sm text-red-200">
+              {errorText}
+            </div>
+          ) : null}
 
-                      {item.image_url ? (
-                        <div className="space-y-3">
-                          <img
-                            src={normalizeImageUrl(item.image_url) || ""}
-                            alt="generated"
-                            className="max-h-[420px] rounded-xl border border-slate-800"
-                          />
-                          {item.content ? (
-                            <div className="whitespace-pre-wrap text-sm leading-6 text-slate-100">
-                              {item.content}
-                            </div>
-                          ) : null}
+          {successText ? (
+            <div className="mb-4 rounded-xl border border-emerald-900 bg-emerald-950 px-4 py-3 text-sm text-emerald-200">
+              {successText}
+            </div>
+          ) : null}
+
+          {workMode === "image" ? (
+            <div className="mb-4 rounded-2xl border border-slate-800 bg-slate-950 p-4">
+              <div className="mb-2 text-sm font-semibold text-slate-300">
+                Image Mode
+              </div>
+              <div className="text-sm text-slate-400">
+                Сейчас backend поддерживает только генерацию изображения по текстовому промпту через <code>/api/images/generate</code>.
+                Сценарий <code>text + image → image</code> пока не реализован на backend.
+              </div>
+            </div>
+          ) : null}
+
+          <div className="grid grid-cols-1 gap-4 xl:grid-cols-[1fr_360px]">
+            <section className="min-h-[500px] rounded-2xl border border-slate-800 bg-slate-950 p-4">
+              <div className="mb-4 flex items-center justify-between">
+                <div className="text-sm font-semibold text-slate-300">Сообщения</div>
+                {loadingMessages ? (
+                  <div className="text-xs text-slate-500">Загрузка...</div>
+                ) : null}
+              </div>
+
+              <div className="flex max-h-[580px] min-h-[420px] flex-col gap-4 overflow-y-auto">
+                {messages.length === 0 ? (
+                  <div className="rounded-xl border border-dashed border-slate-700 bg-slate-900 p-4 text-sm text-slate-400">
+                    История пуста. Создай чат или отправь первое сообщение.
+                  </div>
+                ) : (
+                  messages.map((item) => {
+                    const imageUrl = normalizeImageUrl(item.image_url);
+                    return (
+                      <div
+                        key={`${item.id}-${item.created_at ?? ""}`}
+                        className={`max-w-[85%] rounded-2xl border p-4 ${
+                          item.role === "user"
+                            ? "self-end border-sky-900 bg-sky-950"
+                            : "self-start border-slate-800 bg-slate-900"
+                        }`}
+                      >
+                        <div className="mb-2 flex items-center justify-between gap-4 text-xs text-slate-400">
+                          <span>{item.role === "user" ? "USER" : "ASSISTANT"}</span>
+                          <span>{formatDate(item.created_at)}</span>
                         </div>
-                      ) : (
-                        <div className="whitespace-pre-wrap text-sm leading-6 text-slate-100">
+
+                        <div className="whitespace-pre-wrap break-words text-sm leading-6">
                           {item.content}
                         </div>
-                      )}
 
-                      <div className="mt-3 flex justify-end">
-                        <button
-                          type="button"
-                          onClick={() => void copyText(item.content || "")}
-                          className="rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:bg-slate-800"
-                        >
-                          Копировать
-                        </button>
+                        {imageUrl ? (
+                          <div className="mt-4">
+                            <img
+                              src={imageUrl}
+                              alt="Generated"
+                              className="max-h-[420px] w-full rounded-xl border border-slate-700 object-contain"
+                            />
+                            <a
+                              href={imageUrl}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="mt-2 inline-block text-xs text-sky-300 hover:text-sky-200"
+                            >
+                              Открыть изображение
+                            </a>
+                          </div>
+                        ) : null}
                       </div>
-                    </div>
-                  ))}
-                  <div ref={messagesEndRef} />
-                </div>
-              )}
-            </div>
-
-            <div className="border-t border-slate-800 bg-slate-900 px-6 py-4">
-              {viewMode === "chat" ? (
-                <div className="space-y-3">
-                  <div className="flex items-end gap-3">
-                    <textarea
-                      value={message}
-                      onChange={(e) => setMessage(e.target.value)}
-                      placeholder="Введите сообщение..."
-                      rows={3}
-                      className="min-h-[90px] flex-1 resize-none rounded-2xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm outline-none"
-                    />
-                    <button
-                      type="button"
-                      onClick={handleSendMessage}
-                      disabled={!selectedChatId || sending || !message.trim()}
-                      className="rounded-2xl bg-white px-5 py-3 text-sm font-semibold text-slate-900 hover:bg-slate-200 disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                      {sending ? "Отправка..." : "Отправить"}
-                    </button>
-                  </div>
-
-                  <div className="flex flex-wrap items-center gap-3">
-                    <input
-                      ref={fileInputRef}
-                      type="file"
-                      multiple
-                      onChange={(e) => void handleFileChange(e)}
-                      className="block text-sm text-slate-300"
-                    />
-                    <button
-                      type="button"
-                      onClick={handleUploadFiles}
-                      disabled={
-                        !selectedChatId ||
-                        uploadingFiles ||
-                        selectedFiles.length === 0
-                      }
-                      className="rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                      {uploadingFiles ? "Загрузка..." : "Загрузить файлы"}
-                    </button>
-
-                    {selectedFiles.length > 0 && (
-                      <div className="text-sm text-slate-400">
-                        Выбрано файлов: {selectedFiles.length}
-                      </div>
-                    )}
-                  </div>
-                </div>
-              ) : (
-                <div className="flex items-end gap-3">
-                  <textarea
-                    value={imagePrompt}
-                    onChange={(e) => setImagePrompt(e.target.value)}
-                    placeholder="Опишите изображение..."
-                    rows={3}
-                    className="min-h-[90px] flex-1 resize-none rounded-2xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm outline-none"
-                  />
-                  <button
-                    type="button"
-                    onClick={handleGenerateImage}
-                    disabled={!selectedChatId || generatingImage || !imagePrompt.trim()}
-                    className="rounded-2xl bg-white px-5 py-3 text-sm font-semibold text-slate-900 hover:bg-slate-200 disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    {generatingImage ? "Генерация..." : "Сгенерировать"}
-                  </button>
-                </div>
-              )}
-            </div>
-          </section>
-
-          <aside className="w-80 border-l border-slate-800 bg-slate-900 p-4">
-            <div className="mb-3 text-sm font-semibold">Файлы чата</div>
-
-            {loadingAttachments ? (
-              <div className="text-sm text-slate-400">Загрузка файлов...</div>
-            ) : attachments.length === 0 ? (
-              <div className="text-sm text-slate-400">Файлы не загружены</div>
-            ) : (
-              <div className="space-y-3">
-                {attachments.map((attachment) => (
-                  <div
-                    key={attachment.id}
-                    className="rounded-xl border border-slate-800 bg-slate-950 p-3"
-                  >
-                    <div className="break-words text-sm font-medium text-slate-100">
-                      {attachment.original_name || attachment.file_name || `Файл #${attachment.id}`}
-                    </div>
-
-                    <div className="mt-1 text-xs text-slate-400">
-                      {attachment.mime_type || "unknown"} ·{" "}
-                      {attachment.size_bytes ?? 0} bytes
-                    </div>
-
-                    <div className="mt-1 text-xs text-slate-500">
-                      status: {attachment.parse_status || "unknown"}
-                    </div>
-
-                    <div className="mt-3 flex justify-end">
-                      <button
-                        type="button"
-                        onClick={() => void handleDeleteAttachment(attachment.id)}
-                        disabled={deletingAttachmentId === attachment.id}
-                        className="rounded-lg border border-red-900 px-3 py-2 text-xs text-red-300 hover:bg-red-950 disabled:cursor-not-allowed disabled:opacity-50"
-                      >
-                        {deletingAttachmentId === attachment.id
-                          ? "Удаление..."
-                          : "Удалить"}
-                      </button>
-                    </div>
-                  </div>
-                ))}
+                    );
+                  })
+                )}
+                <div ref={messagesEndRef} />
               </div>
-            )}
-          </aside>
+            </section>
+
+            <section className="rounded-2xl border border-slate-800 bg-slate-950 p-4">
+              <div className="mb-4 text-sm font-semibold text-slate-300">Файлы чата</div>
+
+              <div className="space-y-3">
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  onChange={handleFileChange}
+                  className="block w-full text-sm text-slate-300"
+                />
+
+                {selectedFile ? (
+                  <div className="rounded-xl border border-slate-800 bg-slate-900 p-3 text-sm text-slate-300">
+                    Выбран файл: {selectedFile.name} ({selectedFile.size} bytes)
+                  </div>
+                ) : (
+                  <div className="text-sm text-slate-500">
+                    {workMode === "image"
+                      ? "Файл можно выбрать для будущего режима text + image, но текущий backend его ещё не использует."
+                      : "Файл будет отправлен вместе с сообщением."}
+                  </div>
+                )}
+
+                {loadingAttachments ? (
+                  <div className="text-sm text-slate-500">Загрузка вложений...</div>
+                ) : attachments.length === 0 ? (
+                  <div className="text-sm text-slate-500">Файлы не загружены</div>
+                ) : (
+                  <div className="space-y-2">
+                    {attachments.map((item) => (
+                      <div
+                        key={item.id}
+                        className="rounded-xl border border-slate-800 bg-slate-900 p-3"
+                      >
+                        <div className="mb-2 text-sm font-medium text-slate-200">
+                          {item.original_name || `Файл #${item.id}`}
+                        </div>
+                        <div className="text-xs text-slate-400">
+                          {item.mime_type || "unknown"} · {item.size_bytes ?? 0} bytes
+                        </div>
+                        <div className="mt-1 text-xs text-slate-500">
+                          Статус: {item.parse_status || "unknown"}
+                        </div>
+                        <div className="mt-3">
+                          <button
+                            type="button"
+                            onClick={() => void handleDeleteAttachment(item)}
+                            disabled={deletingAttachmentId === item.id}
+                            className="rounded-lg border border-red-900 bg-red-950 px-3 py-2 text-xs font-semibold text-red-200 hover:bg-red-900/50 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            {deletingAttachmentId === item.id
+                              ? "Удаление..."
+                              : "Удалить файл"}
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </section>
+          </div>
+        </div>
+
+        <div className="border-t border-slate-800 bg-slate-900 px-6 py-4">
+          {workMode === "chat" ? (
+            <form onSubmit={handleSendMessage} className="flex items-end gap-3">
+              <textarea
+                value={message}
+                onChange={(e) => setMessage(e.target.value)}
+                placeholder="Введите сообщение..."
+                rows={4}
+                className="min-h-[96px] flex-1 rounded-2xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm outline-none"
+              />
+              <button
+                type="submit"
+                disabled={sending}
+                className="rounded-2xl bg-white px-6 py-4 text-sm font-semibold text-slate-900 hover:bg-slate-200 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {sending ? "Отправка..." : "Отправить"}
+              </button>
+            </form>
+          ) : (
+            <form onSubmit={handleGenerateImage} className="flex items-end gap-3">
+              <textarea
+                value={imagePrompt}
+                onChange={(e) => setImagePrompt(e.target.value)}
+                placeholder="Опиши изображение, которое нужно сгенерировать..."
+                rows={4}
+                className="min-h-[96px] flex-1 rounded-2xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm outline-none"
+              />
+              <button
+                type="submit"
+                disabled={generatingImage}
+                className="rounded-2xl bg-white px-6 py-4 text-sm font-semibold text-slate-900 hover:bg-slate-200 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {generatingImage ? "Генерация..." : "Сгенерировать"}
+              </button>
+            </form>
+          )}
         </div>
       </main>
     </div>
