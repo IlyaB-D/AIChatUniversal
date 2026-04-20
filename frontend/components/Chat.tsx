@@ -835,6 +835,13 @@ export default function Chat() {
     setSelectedFile(file);
   }
 
+  function clearSelectedFile() {
+    setSelectedFile(null);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+  }
+
   async function handleSendMessage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
@@ -902,10 +909,7 @@ export default function Chat() {
       await loadAttachmentsForChat(chat.id);
       await loadChats();
 
-      setSelectedFile(null);
-      if (fileInputRef.current) {
-        fileInputRef.current.value = "";
-      }
+      clearSelectedFile();
     } catch (error) {
       console.error("Ошибка отправки сообщения:", error);
 
@@ -1069,14 +1073,16 @@ export default function Chat() {
                   ? "Вход..."
                   : "Регистрация..."
                 : authMode === "login"
-                ? "Войти"
-                : "Зарегистрироваться"}
+                  ? "Войти"
+                  : "Зарегистрироваться"}
             </button>
           </form>
         </div>
       </div>
     );
   }
+
+  const messageBoxHeightClass = workMode === "image" ? "min-h-[420px]" : "min-h-[520px]";
 
   return (
     <div className="flex h-screen bg-slate-950 text-white">
@@ -1304,7 +1310,7 @@ export default function Chat() {
           ) : null}
 
           <div className="grid grid-cols-1 gap-4 xl:grid-cols-[1fr_360px]">
-            <section className="min-h-[500px] rounded-2xl border border-slate-800 bg-slate-950 p-4">
+            <section className={`rounded-2xl border border-slate-800 bg-slate-950 p-4 ${messageBoxHeightClass}`}>
               <div className="mb-4 flex items-center justify-between">
                 <div className="text-sm font-semibold text-slate-300">Сообщения</div>
                 {loadingMessages ? (
@@ -1312,7 +1318,7 @@ export default function Chat() {
                 ) : null}
               </div>
 
-              <div className="flex max-h-[580px] min-h-[420px] flex-col gap-4 overflow-y-auto">
+              <div className="flex max-h-[580px] flex-col gap-4 overflow-y-auto">
                 {messages.length === 0 ? (
                   <div className="rounded-xl border border-dashed border-slate-700 bg-slate-900 p-4 text-sm text-slate-400">
                     История пуста. Создай чат или отправь первое сообщение.
@@ -1371,12 +1377,29 @@ export default function Chat() {
                   ref={fileInputRef}
                   type="file"
                   onChange={handleFileChange}
-                  className="block w-full text-sm text-slate-300"
+                  className="hidden"
                 />
+
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  className="w-full rounded-xl border border-slate-700 bg-slate-900 px-4 py-3 text-sm font-semibold text-slate-200 hover:bg-slate-800"
+                >
+                  📎 Загрузить файл
+                </button>
 
                 {selectedFile ? (
                   <div className="rounded-xl border border-slate-800 bg-slate-900 p-3 text-sm text-slate-300">
                     Выбран файл: {selectedFile.name} ({selectedFile.size} bytes)
+                    <div className="mt-3">
+                      <button
+                        type="button"
+                        onClick={clearSelectedFile}
+                        className="rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:bg-slate-800"
+                      >
+                        Очистить выбор
+                      </button>
+                    </div>
                   </div>
                 ) : (
                   <div className="text-sm text-slate-500">
